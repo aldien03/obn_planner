@@ -21,30 +21,1602 @@
  *                                                                         *
  ***************************************************************************/
 """
-
 import os
+import configparser
+import subprocess
+import sys
+import collections # For defaultdict
+import datetime # For time parsing
+import traceback # For detailed error logging
+import csv # For CSV export
 
-from qgis.PyQt import QtGui, QtWidgets, uic
-from qgis.PyQt.QtCore import pyqtSignal
+from qgis.PyQt import QtWidgets, uic
+from qgis.PyQt.QtCore import pyqtSignal, QVariant, Qt, QCoreApplication
+from qgis.PyQt.QtWidgets import QFileDialog, QMessageBox, QProgressDialog, QInputDialog # Added imports
+from qgis.core import (
+    QgsMessageLog, Qgis, QgsProject, QgsVectorLayer,
+    QgsField, QgsFields, QgsFeature, QgsGeometry, QgsFeatureRequest,
+    QgsPointXY, QgsWkbTypes, QgsVectorFileWriter, QgsCoordinateReferenceSystem, # Added CRS
+    QgsExpression, QgsVectorLayerUtils, QgsVectorDataProvider # Added Expression, VectorLayerUtils, VectorDataProvider
+)
 
+# Load the UI class from the generated UI file
 FORM_CLASS, _ = uic.loadUiType(os.path.join(
     os.path.dirname(__file__), 'MapCatalog_dockwidget_base.ui'))
 
+# Config filename
+CONFIG_FILENAME = 'config.ini' # ADJUST IF YOUR FILENAME IS DIFFERENT
+
+# Field names used internally - should match config keys
+FN_SEQUENCE = 'Sequence'
+FN_LINENAME = 'LineName'
+FN_SHOTPOINT = 'ShotPoint'
+FN_EASTING = 'Easting'
+FN_NORTHING = 'Northing'
+FN_RECORD = 'Record'
+FN_FILENAME = 'FileName'  # Added field to track source filenames
+
 
 class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
-
+    """Dock widget for the Map Catalog plugin."""
     closingPlugin = pyqtSignal()
 
     def __init__(self, parent=None):
         """Constructor."""
         super(MapCatalogDockWidget, self).__init__(parent)
-        # Set up the user interface from Designer.
-        # After setupUI you can access any designer object by doing
-        # self.<objectname>, and you can use autoconnect slots - see
-        # http://doc.qt.io/qt-5/designer-using-a-ui-file.html
-        # #widgets-and-dialogs-with-auto-connect
         self.setupUi(self)
 
+        self.config = None
+        self.config_path = os.path.join(os.path.dirname(__file__), CONFIG_FILENAME)
+        self.project = QgsProject.instance()
+        self.current_layer = None
+        # Essential fields - add FileName but don't make it absolutely required yet for backward compatibility
+        self._required_field_names = {FN_RECORD, FN_LINENAME, FN_SHOTPOINT, FN_EASTING, FN_NORTHING, FN_SEQUENCE}
+
+        self.load_config() # Also populates combobox on success/failure
+
+        # --- Connect signals and slots ---
+        self.openConfigpushButton.clicked.connect(self.on_open_config_clicked)
+        self.selectMapCatalogcomboBox.currentIndexChanged.connect(self.on_layer_selection_changed)
+        self.listWidget.currentItemChanged.connect(self.on_list_item_selection_changed)
+
+        # Phase 3 & 4 buttons
+        self.ImportLinepushButton.clicked.connect(self.on_import_sps_clicked)
+        self.UpdateLinePushButton.clicked.connect(self.on_update_line_clicked)
+        self.DeleteLinepushButton.clicked.connect(self.on_delete_line_clicked)
+        
+        # Export buttons
+        self.xyzpushButton.clicked.connect(self.on_export_xyz_clicked)
+        self.csvpushButton.clicked.connect(self.on_export_csv_clicked)
+
+        # Initial UI state
+        self._update_selection_dependent_ui(None)
+
+
+    # --- Configuration Loading (Phase 1) ---
+    def _parse_range(self, range_str):
+        """Parses 'start-end' string (1-based) to 0-based slice indices (start, end)."""
+        try:
+            start, end = map(int, range_str.split('-'))
+            if start < 1 or end < start: raise ValueError("Invalid range values")
+            return start - 1, end
+        except ValueError as e:
+            QgsMessageLog.logMessage(f"Invalid range format: '{range_str}'. {e}", "MapCatalog Config", Qgis.Warning)
+            return None
+
+    def load_config(self):
+        """Loads and parses configuration from the INI file."""
+        # Reset state before loading
+        self.config = None
+        self._required_field_names = {FN_RECORD, FN_LINENAME, FN_SHOTPOINT, FN_EASTING, FN_NORTHING, FN_SEQUENCE} # Reset required fields
+
+        if not os.path.exists(self.config_path):
+            error_msg = f"Config file not found: {self.config_path}"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Config", Qgis.Critical)
+            QMessageBox.critical(self, "Config Error", error_msg)
+            self.populate_layer_combobox()
+            self._set_ui_enabled_on_config_status(False)
+            return
+
+        # Initialize configparser PRESERVING CASE for option keys
+        config_parser = configparser.ConfigParser(
+            interpolation=None,
+            inline_comment_prefixes=('#', ';')
+        )
+        # *** Preserve case for option keys ***
+        config_parser.optionxform = str
+
+        try:
+            # Read the config file, explicitly specifying encoding
+            read_ok = config_parser.read(self.config_path, encoding='utf-8')
+            if not read_ok: raise OSError(f"Failed to read file: {self.config_path}")
+
+            # Initialize config dictionary structure matching INI sections
+            parsed_config = {
+                'SPS_Import_Settings': {},
+                'FileNameExtract': {},
+                'FieldColumns': {},
+                'FieldTypes': {}
+            }
+
+            # --- Section: SPS_Import_Settings ---
+            settings_section = 'SPS_Import_Settings'
+            if settings_section not in config_parser: raise configparser.NoSectionError(settings_section)
+            parsed_config[settings_section]['header_rows'] = config_parser.getint(settings_section, 'header_rows')
+            parsed_config[settings_section]['Ext'] = config_parser.get(settings_section, 'Ext')
+
+            # --- Section: FileNameExtract ---
+            fn_extract_section = 'FileNameExtract'
+            if fn_extract_section in config_parser: # Section might be optional
+                for key in config_parser.options(fn_extract_section):
+                     range_str = config_parser.get(fn_extract_section, key)
+                     range_val = self._parse_range(range_str)
+                     if range_val:
+                         # Use the case as defined in INI for the dictionary key
+                         parsed_config[fn_extract_section][key] = range_val
+                     else:
+                          QgsMessageLog.logMessage(f"Invalid range format for '{key}' in [{fn_extract_section}]: '{range_str}'", "MapCatalog Config", Qgis.Warning)
+            else:
+                 QgsMessageLog.logMessage(f"Section [{fn_extract_section}] not found in config. Filename extraction disabled.", "MapCatalog Config", Qgis.Info)
+
+
+            # --- Section: FieldColumns ---
+            cols_section = 'FieldColumns'
+            if cols_section not in config_parser: raise configparser.NoSectionError(cols_section)
+            for key in config_parser.options(cols_section):
+                field_name = key # Key now preserves case from INI file
+                range_str = config_parser.get(cols_section, key)
+                range_val = self._parse_range(range_str)
+                if range_val:
+                    # Use the case as defined in INI for the dictionary key
+                    parsed_config[cols_section][field_name] = range_val
+                else:
+                    QgsMessageLog.logMessage(f"Invalid range format for '{field_name}' in [{cols_section}]: '{range_str}'", "MapCatalog Config", Qgis.Warning)
+                    # Check required fields based on constants (case-sensitive)
+                    if field_name in self._required_field_names:
+                         raise ValueError(f"Invalid range format for required field '{field_name}' in [{cols_section}]: '{range_str}'")
+
+            # --- Section: FieldTypes ---
+            types_section = 'FieldTypes'
+            if types_section not in config_parser: raise configparser.NoSectionError(types_section)
+            for key in config_parser.options(types_section):
+                field_name = key # Key now preserves case from INI file
+                type_str = config_parser.get(types_section, key)
+                parsed_config[types_section][field_name] = type_str
+
+
+            # --- Final Config Validation ---
+            # ADD DEBUG PRINTS HERE
+            print("--- MapCatalog Config Debug ---")
+            print("Required Fields Constants:", self._required_field_names)
+            print("Parsed Column Keys:", set(parsed_config['FieldColumns'].keys()))
+            print("Parsed Type Keys:", set(parsed_config['FieldTypes'].keys()))
+            print("-----------------------------")
+            # END DEBUG PRINTS
+
+            # Check essential fields have both column and type definitions
+            # Use the keys extracted from the INI which now preserve case
+            defined_col_keys = set(parsed_config['FieldColumns'].keys())
+            defined_type_keys = set(parsed_config['FieldTypes'].keys())
+
+            # Compare against the required field names (constants, case-sensitive)
+            missing_cols = self._required_field_names - defined_col_keys
+            missing_types = self._required_field_names - defined_type_keys
+
+            # Raise error only if *required* fields defined by constants are missing
+            if missing_cols: raise ValueError(f"Missing critical column definitions in [{cols_section}]: {missing_cols}")
+            if missing_types: raise ValueError(f"Missing critical type definitions in [{types_section}]: {missing_types}")
+
+            # Optional consistency check (commented out for now to focus on main error)
+            # if defined_col_keys != defined_type_keys:
+            #      only_in_cols = defined_col_keys - type_keys
+            #      only_in_types = defined_type_keys - a
+            #      if only_in_cols: QgsMessageLog.logMessage(f"Fields in [{cols_section}] missing type in [{types_section}]: {only_in_cols}", "MapCatalog Config", Qgis.Warning)
+            #      if only_in_types: QgsMessageLog.logMessage(f"Fields have type in [{types_section}] missing column range in [{cols_section}]: {only_in_types}", "MapCatalog Config", Qgis.Warning)
+
+
+            self.config = parsed_config # Assign successfully parsed config
+            QgsMessageLog.logMessage(f"Config loaded successfully from {self.config_path}", "MapCatalog", Qgis.Info)
+            self._set_ui_enabled_on_config_status(True)
+            self.populate_layer_combobox() # Populate layers now that config is ready
+
+        except (configparser.Error, ValueError, KeyError, OSError) as e:
+            # Ensure the error message clearly indicates the context
+            error_msg = f"Error processing config file '{self.config_path}':\n{e}\n{traceback.format_exc()}"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Config", Qgis.Critical)
+            # Add section name to MessageBox if possible
+            section_context = ""
+            if isinstance(e, ValueError) and "definitions in [" in str(e):
+                 section_context = str(e).split("[")[1].split("]")[0] # Extract section name if possible
+                 QMessageBox.critical(self, "Configuration Error", f"Error in config section [{section_context}]:\n{e}")
+            else:
+                 QMessageBox.critical(self, "Configuration Error", f"Error processing config file:\n{e}")
+
+            self.config = None
+            self.populate_layer_combobox() # Clear layers
+            self._set_ui_enabled_on_config_status(False)
+
+
+    def _set_ui_enabled_on_config_status(self, enabled: bool):
+        """Enable/disable UI based on config load status."""
+        self.ImportLinepushButton.setEnabled(enabled and self.current_layer is not None)
+        self.UpdateLinePushButton.setEnabled(False) # Depends on list selection
+        self.DeleteLinepushButton.setEnabled(False) # Depends on list selection
+        self.fgspspinBox.setEnabled(False)          # Depends on list selection
+        self.lgspspinbox.setEnabled(False)          # Depends on list selection
+        self.listWidget.setEnabled(True)
+        self.selectMapCatalogcomboBox.setEnabled(True)
+        self.openConfigpushButton.setEnabled(True)
+        # Enable export buttons when any layer is selected
+        # These should always be available when a layer is selected
+        self.xyzpushButton.setEnabled(self.current_layer is not None)
+        self.csvpushButton.setEnabled(self.current_layer is not None)
+
+
+    # --- Layer Management and UI Population (Phase 2) ---
+    def _is_valid_map_catalog_layer(self, layer):
+        """Checks if a layer seems to be a valid Map Catalog layer."""
+        if not isinstance(layer, QgsVectorLayer): 
+            QgsMessageLog.logMessage(f"Layer {layer.name()} is not a QgsVectorLayer", "MapCatalog Debug", Qgis.Info)
+            return False
+        # Check if the source path contains .gpkg (rather than requiring it to end with .gpkg)
+        if '.gpkg' not in layer.source().lower(): 
+            QgsMessageLog.logMessage(f"Layer {layer.name()} source doesn't contain .gpkg: {layer.source()}", "MapCatalog Debug", Qgis.Info)
+            return False
+
+        layer_field_names = {f.name() for f in layer.fields()}
+        QgsMessageLog.logMessage(f"Layer {layer.name()} fields: {layer_field_names}", "MapCatalog Debug", Qgis.Info)
+        QgsMessageLog.logMessage(f"Required fields: {self._required_field_names}", "MapCatalog Debug", Qgis.Info)
+        
+        if not self._required_field_names: 
+            QgsMessageLog.logMessage("No required field names defined (config might not be loaded)", "MapCatalog Debug", Qgis.Warning)
+            return False # Config not loaded
+        
+        if not self._required_field_names.issubset(layer_field_names): 
+            missing = self._required_field_names - layer_field_names
+            QgsMessageLog.logMessage(f"Layer {layer.name()} missing fields: {missing}", "MapCatalog Debug", Qgis.Warning)
+            return False # Missing essential fields
+
+        # Check geometry type allows points
+        wkb_type = layer.wkbType()
+        is_point = QgsWkbTypes.geometryType(wkb_type) == QgsWkbTypes.PointGeometry
+        is_no_geom = wkb_type == QgsWkbTypes.NoGeometry
+        QgsMessageLog.logMessage(f"Layer {layer.name()} geometry: {QgsWkbTypes.displayString(wkb_type)} (isPoint={is_point}, isNoGeom={is_no_geom})", "MapCatalog Debug", Qgis.Info)
+        
+        if not (is_point or is_no_geom): # Allow NoGeometry? Maybe not.
+            QgsMessageLog.logMessage(f"Layer {layer.name()} has invalid geometry type: {QgsWkbTypes.displayString(wkb_type)}", "MapCatalog Debug", Qgis.Warning)
+            return False
+
+        QgsMessageLog.logMessage(f"Layer {layer.name()} is VALID as Map Catalog layer", "MapCatalog Debug", Qgis.Info)
+        return True
+
+    def find_map_catalog_layers(self):
+        """Finds potential Map Catalog layers in the project."""
+        return [layer for layer in self.project.mapLayers().values() if self._is_valid_map_catalog_layer(layer)]
+
+    def populate_layer_combobox(self):
+        """Populates the layer selection combobox."""
+        self.selectMapCatalogcomboBox.blockSignals(True)
+        current_id = self.selectMapCatalogcomboBox.currentData() # Remember current selection
+        self.selectMapCatalogcomboBox.clear()
+        self.selectMapCatalogcomboBox.addItem("-- Select Target or Create New --", None) # Placeholder/Create hint
+
+        if self.config: # Only look for layers if config is valid
+            found_layers = self.find_map_catalog_layers()
+            for layer in sorted(found_layers, key=lambda l: l.name()):
+                self.selectMapCatalogcomboBox.addItem(layer.name(), layer.id())
+
+            # Try to restore previous selection if still valid
+            index = self.selectMapCatalogcomboBox.findData(current_id)
+            if index != -1:
+                self.selectMapCatalogcomboBox.setCurrentIndex(index)
+            elif self.selectMapCatalogcomboBox.count() > 1: # Select first valid layer if previous gone
+                 self.selectMapCatalogcomboBox.setCurrentIndex(1) # Skip placeholder
+            else: # No valid layers found or restored
+                 self.selectMapCatalogcomboBox.setCurrentIndex(0)
+        else:
+             self.selectMapCatalogcomboBox.setCurrentIndex(0) # Only placeholder if no config
+
+
+        self.selectMapCatalogcomboBox.blockSignals(False)
+        self.on_layer_selection_changed() # Trigger update based on selection
+
+
+    def on_layer_selection_changed(self):
+        """Handles changes in the layer combobox selection."""
+        selected_id = self.selectMapCatalogcomboBox.currentData()
+        layer_found = False
+
+        if selected_id:
+            layer = self.project.mapLayer(selected_id)
+            if layer and self._is_valid_map_catalog_layer(layer):
+                self.current_layer = layer
+                self.refresh_line_summary_list()
+                layer_found = True
+
+        if not layer_found:
+            self.current_layer = None
+            self.listWidget.clear()
+
+        # Enable import button ONLY if a valid layer is selected (creation handled within import)
+        self.ImportLinepushButton.setEnabled(self.config is not None) # Enable if config is loaded, layer check happens in import function
+        
+        # Make sure export buttons are enabled when a layer is selected
+        self.xyzpushButton.setEnabled(self.current_layer is not None)
+        self.csvpushButton.setEnabled(self.current_layer is not None)
+        
+        self._update_selection_dependent_ui(self.listWidget.currentItem())
+
+
+    def refresh_line_summary_list(self):
+        """Queries the selected layer and populates the list widget."""
+        self.listWidget.clear()
+        self._update_selection_dependent_ui(None)
+
+        if not self.current_layer or not self.config: return
+
+        layer_fields = self.current_layer.fields()
+        summary_fields = {FN_SEQUENCE, FN_LINENAME, FN_SHOTPOINT}
+        if not summary_fields.issubset({f.name() for f in layer_fields}):
+            QgsMessageLog.logMessage(f"Layer '{self.current_layer.name()}' missing fields for summary.", "MapCatalog", Qgis.Warning)
+            return
+
+        line_summaries = collections.defaultdict(lambda: {'min_sp': float('inf'), 'max_sp': float('-inf'), 'count': 0})
+        attr_indices = [layer_fields.lookupField(name) for name in summary_fields]
+        request = QgsFeatureRequest().setFlags(QgsFeatureRequest.NoGeometry).setSubsetOfAttributes(attr_indices)
+        feature_count = 0
+
+        try:
+            # Progress reporting for large layers
+            total_features = self.current_layer.featureCount()
+            
+            # Check if layer is empty to avoid getting stuck
+            if total_features == 0:
+                QgsMessageLog.logMessage(f"Layer '{self.current_layer.name()}' is empty. No summaries to display.", "MapCatalog", Qgis.Info)
+                return
+                
+            progress = QProgressDialog(f"Reading summaries from '{self.current_layer.name()}'...", "Cancel", 0, total_features, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(1000) # Only show if takes > 1 sec
+
+            for feature in self.current_layer.getFeatures(request):
+                if progress.wasCanceled(): break
+                progress.setValue(feature_count)
+                feature_count += 1
+                try:
+                    seq_val = int(feature.attribute(FN_SEQUENCE))
+                    line_val = int(feature.attribute(FN_LINENAME)) # Assuming int
+                    sp_val = int(feature.attribute(FN_SHOTPOINT))
+                    key = (seq_val, line_val)
+                    summary = line_summaries[key]
+                    summary['min_sp'] = min(summary['min_sp'], sp_val)
+                    summary['max_sp'] = max(summary['max_sp'], sp_val)
+                    summary['count'] += 1
+                except (ValueError, TypeError, OverflowError):
+                    pass # Skip features with invalid numbers in summary fields
+            progress.setValue(total_features) # Complete progress bar
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error reading features for summary: {e}\n{traceback.format_exc()}", "MapCatalog", Qgis.Critical)
+            return
+
+        # Populate List Widget
+        sorted_keys = sorted(line_summaries.keys())
+        self.listWidget.blockSignals(True)
+        for seq, line_name in sorted_keys:
+            summary = line_summaries[(seq, line_name)]
+            fgsp = summary['min_sp'] if summary['count'] > 0 else 0
+            lgsp = summary['max_sp'] if summary['count'] > 0 else 0
+            if fgsp == float('inf'): fgsp = lgsp
+            if lgsp == float('-inf'): lgsp = fgsp
+
+            display_text = f"Seq: {seq} - Line: {line_name} (FGSP: {fgsp} - LGSP: {lgsp}) [{summary['count']} pts]"
+            item = QtWidgets.QListWidgetItem(display_text)
+            item_data = {'sequence': seq, 'line_name': line_name, 'fgsp': fgsp, 'lgsp': lgsp }
+            item.setData(Qt.UserRole, QVariant(item_data))
+            self.listWidget.addItem(item)
+        self.listWidget.blockSignals(False)
+        self.listWidget.setEnabled(True)
+
+
+    def on_list_item_selection_changed(self, current_item, previous_item):
+        """Handles list widget selection changes."""
+        self._update_selection_dependent_ui(current_item)
+
+
+    def _update_selection_dependent_ui(self, selected_item):
+        """Updates UI based on list selection."""
+        can_modify = False
+        if selected_item:
+            item_data_variant = selected_item.data(Qt.UserRole)
+            item_data = item_data_variant.value() if isinstance(item_data_variant, QVariant) else item_data_variant
+            if isinstance(item_data, dict):
+                self.fgspspinBox.setValue(item_data.get('fgsp', self.fgspspinBox.minimum()))
+                self.lgspspinbox.setValue(item_data.get('lgsp', self.lgspspinbox.minimum()))
+                can_modify = self.current_layer is not None and self.config is not None
+            else: # Reset if data invalid
+                self.fgspspinBox.setValue(self.fgspspinBox.minimum())
+                self.lgspspinbox.setValue(self.lgspspinbox.minimum())
+        else: # Reset if no selection
+            self.fgspspinBox.setValue(self.fgspspinBox.minimum())
+            self.lgspspinbox.setValue(self.lgspspinbox.minimum())
+
+        self.UpdateLinePushButton.setEnabled(can_modify)
+        self.DeleteLinepushButton.setEnabled(can_modify)
+        self.fgspspinBox.setEnabled(can_modify)
+        self.lgspspinbox.setEnabled(can_modify)
+
+
+    # --- Core Plugin Logic (Phase 3: Import) ---
+
+    def on_import_sps_clicked(self):
+        """Handles the 'Import SPS' button click."""
+        if not self.config:
+            QMessageBox.warning(self, "Configuration Missing", "Cannot import: Plugin configuration not loaded.")
+            return
+
+        target_layer = self.current_layer
+        create_new = False
+
+        # Check if user intends to create a new layer
+        if self.selectMapCatalogcomboBox.currentIndex() == 0: # Placeholder selected
+            create_new = True
+            # Prompt for new layer details
+            new_layer_name, ok = QInputDialog.getText(self, "Create New Layer", "Enter name for the new Map Catalog layer:")
+            if not ok or not new_layer_name:
+                QgsMessageLog.logMessage("Layer creation cancelled.", "MapCatalog", Qgis.Info)
+                return
+            # Prompt for GeoPackage path
+            # TODO: Maybe default to project directory? Or a configurable path?
+            default_path = os.path.join(self.project.homePath() or os.path.expanduser("~"), f"{new_layer_name}.gpkg")
+            gpkg_path, _ = QFileDialog.getSaveFileName(self, "Save New GeoPackage Layer", default_path, "GeoPackage files (*.gpkg)")
+            if not gpkg_path:
+                QgsMessageLog.logMessage("GeoPackage path selection cancelled.", "MapCatalog", Qgis.Info)
+                return
+            # Ensure correct extension
+            if not gpkg_path.lower().endswith('.gpkg'):
+                gpkg_path += '.gpkg'
+
+            # Prompt for CRS (use project CRS as default)
+            target_crs = self.project.crs()
+            crs_selector = QtWidgets.QDialog() # Placeholder for proper CRS selector dialog
+            # For now, just confirm project CRS or ask for EPSG
+            reply = QMessageBox.question(self, "Specify CRS",
+                                        f"Use project CRS ({target_crs.authid()} - {target_crs.description()}) for the new layer?",
+                                        QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.No:
+                epsg, ok = QInputDialog.getInt(self, "Specify EPSG Code", "Enter EPSG code for the new layer:", target_crs.postgisSrid(), 1)
+                if ok:
+                    new_crs = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+                    if new_crs.isValid():
+                        target_crs = new_crs
+                    else:
+                        QMessageBox.warning(self, "Invalid CRS", f"EPSG:{epsg} is not a valid CRS. Using project CRS.")
+                else:
+                    QMessageBox.warning(self, "CRS Not Specified", "Using project CRS.")
+
+            # Create the layer
+            target_layer = self._create_gpkg_layer(gpkg_path, new_layer_name, target_crs)
+            if not target_layer:
+                 QMessageBox.critical(self, "Layer Creation Failed", f"Could not create the GeoPackage layer: {new_layer_name}")
+                 return
+            # Add layer to project and update combobox
+            self.project.addMapLayer(target_layer)
+            self.populate_layer_combobox()
+            # Select the newly created layer in the combobox
+            idx = self.selectMapCatalogcomboBox.findData(target_layer.id())
+            if idx != -1:
+                self.selectMapCatalogcomboBox.setCurrentIndex(idx)
+            else: # Should not happen
+                 QMessageBox.warning(self, "Error", "Could not select newly created layer.")
+                 return
+            self.current_layer = target_layer # Ensure current_layer is set
+
+
+        elif not self.current_layer:
+             QMessageBox.warning(self, "No Target Layer", "Please select a target layer from the dropdown or choose the first option to create a new one.")
+             return
+
+
+        # --- File Selection ---
+        # Access from 'SPS_Import_Settings' section now
+        sps_ext = self.config['SPS_Import_Settings'].get('Ext', 'S01') # Corrected
+        file_filter = f"SPS Files (*.{sps_ext});;All files (*.*)"
+        sps_files, _ = QFileDialog.getOpenFileNames(self, "Select SPS File(s) to Import", "", file_filter)
+
+        if not sps_files:
+            return # User cancelled
+
+        # Access from 'SPS_Import_Settings' section now
+        header_rows = self.config['SPS_Import_Settings']['header_rows'] # Corrected
+
+        # Access FieldColumns as before (this part was already correct)
+        record_col = self.config['FieldColumns'][FN_RECORD]
+        sp_col = self.config['FieldColumns'][FN_SHOTPOINT]
+
+        # Filter out duplicate files before showing progress dialog
+        files_to_import = []
+        duplicate_files = []
+        seq_duplicate_files = []
+
+        # First pass - check all files for duplicates
+        for file_path in sps_files:
+            base_filename = os.path.basename(file_path)
+            
+            # Check for duplicates
+            is_duplicate, seq_nums, line_names, is_filename_duplicate = self._check_for_duplicate_sequence(file_path, self.current_layer)
+            
+            if is_filename_duplicate:
+                # Track exact filename duplicates
+                duplicate_files.append(base_filename)
+            elif is_duplicate:
+                # Track sequence duplicates
+                seq_duplicate_files.append((file_path, base_filename, seq_nums, line_names))
+            else:
+                # File is clean to import
+                files_to_import.append(file_path)
+
+        # Handle exact filename duplicates first if any exist
+        if duplicate_files:
+            # Show a single message for all duplicate files
+            if len(duplicate_files) == 1:
+                message = f"The file '{duplicate_files[0]}' has already been imported before.\n\nSkipping this file to prevent duplicate data."
+            else:
+                file_list = '\n• '.join(duplicate_files)
+                message = f"The following {len(duplicate_files)} files have already been imported before:\n\n• {file_list}\n\nSkipping these files to prevent duplicate data."
+                
+            QMessageBox.information(self, "Skipping Duplicate Files", message)
+            for filename in duplicate_files:
+                QgsMessageLog.logMessage(f"Automatically skipping file '{filename}' that was previously imported", "MapCatalog Import", Qgis.Info)
+
+        # Now handle sequence duplicates
+        for file_tuple in seq_duplicate_files:
+            file_path, base_filename, seq_nums, line_names = file_tuple
+            
+            # Format the duplicate info for display
+            duplicates_info = ", ".join([f"Seq {seq} (Line {line})" for seq, line in zip(seq_nums, line_names)])
+            
+            # Ask user whether to skip, overwrite, or cancel
+            duplicate_msg = f"File '{base_filename}' contains sequence numbers that already exist in the layer:\n{duplicates_info}\n\nWhat would you like to do?"
+            reply = QMessageBox.question(
+                self, 
+                "Duplicate Sequences Detected", 
+                duplicate_msg, 
+                QMessageBox.StandardButtons(
+                    QMessageBox.Yes | 
+                    QMessageBox.No | 
+                    QMessageBox.Cancel
+                ),
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:  # Skip
+                QgsMessageLog.logMessage(f"Skipping duplicate file '{base_filename}'", "MapCatalog Import", Qgis.Info)
+                # Don't add to files_to_import
+            elif reply == QMessageBox.No:  # Import anyway (replace)
+                QgsMessageLog.logMessage(f"Will import duplicate file '{base_filename}' (overwrite)", "MapCatalog Import", Qgis.Warning)
+                
+                # Delete existing features with these sequence numbers
+                for seq_num in seq_nums:
+                    filter_expr = f"\"{FN_SEQUENCE}\" = {seq_num}"
+                    self._delete_features_by_filter(self.current_layer, filter_expr, "Delete Duplicate")
+                    
+                # Add to files to import
+                files_to_import.append(file_path)
+            else:  # Cancel
+                QgsMessageLog.logMessage(f"Import cancelled by user at duplicate detection", "MapCatalog Import", Qgis.Info)
+                return  # Cancel the whole import process
+
+        # If no files left to import after duplicate handling, exit gracefully
+        if not files_to_import:
+            QMessageBox.information(self, "Import Completed", "No files were imported after duplicate checks.")
+            return
+            
+        # Now show progress dialog only for files we're actually going to import
+        total_files = len(files_to_import)
+        processed_files = 0
+        overall_progress = QProgressDialog("Importing SPS Files...", "Cancel", 0, total_files * 100, self) # Approximate progress
+        overall_progress.setWindowModality(Qt.WindowModal)
+        overall_progress.setMinimumDuration(1000)
+
+        # --- Process Each File ---
+        for file_path in files_to_import:
+            if overall_progress.wasCanceled(): break
+            processed_files += 1
+            base_filename = os.path.basename(file_path)
+            overall_progress.setLabelText(f"Processing: {base_filename} ({processed_files}/{total_files})")
+            overall_progress.setValue(processed_files * 100 - 100) # Start file progress
+            
+            # At this point, we've already filtered out all duplicates in the pre-processing step
+            # So we're only dealing with files that are ready to import
+
+            # 1. Scan for actual FGSP/LGSP in the file
+            actual_fgsp, actual_lgsp = self._scan_sps_for_range(file_path, header_rows, record_col, sp_col)
+
+            if actual_fgsp is None:
+                QgsMessageLog.logMessage(f"Skipping '{base_filename}': No valid ShotPoint records found.", "MapCatalog Import", Qgis.Warning)
+                QMessageBox.warning(self, "Import Warning", f"Skipping file: '{base_filename}'\nNo valid ShotPoint records found or file is empty/unreadable.")
+                continue
+                
+            # 2. Skip FGSP/LGSP selection dialog and use the full range
+            # Log the detected range instead
+            QgsMessageLog.logMessage(f"Importing '{base_filename}': Full range from SP {actual_fgsp} to {actual_lgsp}", "MapCatalog Import", Qgis.Info)
+            
+            # 3. Parse and Add Features using the detected range
+            success = self._parse_and_add_sps_data(file_path, self.current_layer, header_rows, actual_fgsp, actual_lgsp, overall_progress, processed_files * 100)
+            if not success:
+                QgsMessageLog.logMessage(f"Import failed for file '{base_filename}'. Check logs.", "MapCatalog Import", Qgis.Critical)
+                # Optionally ask user if they want to continue with other files
+                reply = QMessageBox.critical(self, "Import Error", f"Failed to import data from:\n{base_filename}\n\nCheck the QGIS Log Messages panel for details.\nContinue with next file?", QMessageBox.Yes | QMessageBox.No)
+                if reply == QMessageBox.No: break # Stop processing remaining files
+
+        overall_progress.setValue(total_files * 100) # Finish progress
+        QMessageBox.information(self, "Import Complete", f"Finished processing {processed_files} SPS file(s).")
+
+        # Refresh list after all imports are done
+        if self.current_layer:
+            self.refresh_line_summary_list()
+
+
+    def _check_for_duplicate_sequence(self, file_path, layer):
+        """Checks if data from this file is already in the layer by detecting duplicate sequence numbers or filenames.
+        Returns a tuple: (is_duplicate, sequence_numbers, line_names, duplicate_filename)
+        """
+        if not layer or not self.config:
+            return False, [], [], False
+            
+        # Extract the sequence from file name if possible
+        base_filename = os.path.basename(file_path)
+        sequence_from_filename = None
+        
+        # First method: Try to extract sequence from filename using FileNameExtract section
+        if 'FileNameExtract' in self.config and 'Sequence' in self.config['FileNameExtract']:
+            try:
+                seq_range = self.config['FileNameExtract']['Sequence']
+                if seq_range and base_filename:
+                    # Adjust for 0-based indexing in Python vs 1-based in config
+                    seq_start, seq_end = seq_range[0] - 1, seq_range[1] - 1
+                    if len(base_filename) > seq_end:
+                        sequence_from_filename = int(base_filename[seq_start:seq_end+1].strip())
+                        QgsMessageLog.logMessage(f"Extracted sequence {sequence_from_filename} from filename '{base_filename}'", "MapCatalog Import", Qgis.Info)
+            except (ValueError, IndexError) as e:
+                QgsMessageLog.logMessage(f"Failed to extract sequence from filename '{base_filename}': {e}", "MapCatalog Import", Qgis.Warning)
+        
+        # Second method: Parse the file to extract sequence information directly
+        sequences_in_file = set()
+        if sequence_from_filename is not None:
+            sequences_in_file.add(sequence_from_filename)
+        else:
+            # Try to read first few lines to extract sequence directly from content
+            try:
+                header_rows = self.config['SPS_Import_Settings']['header_rows']
+                if 'Sequence' in self.config['FieldColumns']:
+                    seq_col = self.config['FieldColumns']['Sequence']
+                    record_col = self.config['FieldColumns']['Record']
+                    
+                    # Read a small portion of the file to extract sequences
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        line_count = 0
+                        for line in f:
+                            line_count += 1
+                            if line_count <= header_rows:
+                                continue
+                            if line_count > 50:  # Only check first 50 data lines
+                                break
+                                
+                            try:
+                                if len(line) >= seq_col[1]:
+                                    # Only process shot records
+                                    if record_col and len(line) >= record_col[1]:
+                                        rec_type = line[record_col[0]:record_col[1]].strip()
+                                        if rec_type != 'S':
+                                            continue
+                                    
+                                    seq_str = line[seq_col[0]:seq_col[1]].strip()
+                                    seq_value = int(seq_str)
+                                    sequences_in_file.add(seq_value)
+                            except (ValueError, IndexError):
+                                pass  # Skip invalid lines
+            except Exception as e:
+                QgsMessageLog.logMessage(f"Failed to extract sequences from file content: {e}", "MapCatalog Import", Qgis.Warning)
+        
+        # Keep track of all duplicates found
+        duplicates_found = False
+        duplicate_seqs = []
+        duplicate_lines = []
+        
+        # Check for duplicate sequences in the layer
+        if sequences_in_file:
+            for seq in sequences_in_file:
+                # Query if this sequence exists in the layer
+                request = QgsFeatureRequest().setFilterExpression(f"\"{FN_SEQUENCE}\" = {seq}")
+                request.setFlags(QgsFeatureRequest.NoGeometry)
+                
+                for feature in layer.getFeatures(request):
+                    # Found a duplicate sequence
+                    line_name = feature[FN_LINENAME] if FN_LINENAME in feature else "Unknown"
+                    duplicate_seqs.append(seq)
+                    duplicate_lines.append(str(line_name))
+                    duplicates_found = True
+                    break  # We only need one match per sequence to confirm it's a duplicate
+        
+        if duplicates_found:
+            return True, duplicate_seqs, duplicate_lines
+            
+        # Check for duplicate filename (if FileName field exists)
+        filename_duplicate = False
+        base_filename = os.path.basename(file_path)
+        
+        if FN_FILENAME in layer.fields().names():
+            # Query if this filename already exists in the layer
+            filename_filter = f"\"{FN_FILENAME}\" = '{base_filename}'"
+            request = QgsFeatureRequest().setFilterExpression(filename_filter)
+            request.setFlags(QgsFeatureRequest.NoGeometry)
+            request.setLimit(1)  # We only need to know if any exist
+            
+            for feature in layer.getFeatures(request):
+                filename_duplicate = True
+                QgsMessageLog.logMessage(f"File '{base_filename}' has already been imported before", "MapCatalog Import", Qgis.Warning)
+                break
+        
+        # Return results - combined duplicate status (by sequence or filename)
+        is_duplicate = duplicates_found or filename_duplicate
+        return is_duplicate, list(sequences_in_file), duplicate_lines, filename_duplicate
+            
+    def _scan_sps_for_range(self, file_path, header_rows, record_col, sp_col):
+        """Scans an SPS file to find the min and max ShotPoint values."""
+        min_sp = float('inf')
+        max_sp = float('-inf')
+        found = False
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for i, line in enumerate(f):
+                    if i < header_rows: continue
+                    if len(line) < sp_col[1]: continue # Line too short
+
+                    try:
+                        rec_type = line[record_col[0]:record_col[1]].strip()
+                        if rec_type == 'S': # Shot point record type check
+                             sp_str = line[sp_col[0]:sp_col[1]].strip()
+                             sp_val = int(sp_str)
+                             min_sp = min(min_sp, sp_val)
+                             max_sp = max(max_sp, sp_val)
+                             found = True
+                    except (ValueError, IndexError):
+                        continue # Skip lines with parsing errors during scan
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error scanning file '{file_path}': {e}", "MapCatalog Scan", Qgis.Critical)
+            return None, None
+
+        return (min_sp, max_sp) if found else (None, None)
+
+
+    def _parse_and_add_sps_data(self, file_path, layer, header_rows, fgsp, lgsp, progress_dialog, base_progress_value):
+        """Parses SPS data within range and adds features to the layer."""
+        features_to_add = []
+        record_col = self.config['FieldColumns'][FN_RECORD]
+        sp_col = self.config['FieldColumns'][FN_SHOTPOINT]
+        east_col = self.config['FieldColumns'][FN_EASTING]
+        north_col = self.config['FieldColumns'][FN_NORTHING]
+        
+        # Get base filename for tracking source file
+        base_filename = os.path.basename(file_path)
+
+        try:
+            # Estimate file size for progress (optional, could use line count)
+            file_size = os.path.getsize(file_path)
+            bytes_read = 0
+
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                line_num = 0
+                for line in f:
+                    line_num += 1
+                    bytes_read += len(line.encode('utf-8')) # Estimate bytes read
+                    progress_value = base_progress_value - 100 + int((bytes_read / file_size) * 99) if file_size else base_progress_value
+                    progress_dialog.setValue(progress_value)
+                    QCoreApplication.processEvents() # Keep UI responsive
+                    if progress_dialog.wasCanceled(): return False
+
+
+                    if line_num <= header_rows: continue
+                    # Basic check for line length - ensure it covers at least essential fields
+                    min_req_len = max(c[1] for c in [record_col, sp_col, east_col, north_col])
+                    if len(line) < min_req_len: continue # Skip short lines
+
+                    try:
+                        # Check Record Type
+                        rec_type = line[record_col[0]:record_col[1]].strip()
+                        if rec_type != 'S': continue # Only process Shot Point records for now
+
+                        # Check SP Range
+                        sp_str = line[sp_col[0]:sp_col[1]].strip()
+                        sp_val = int(sp_str)
+                        if not (fgsp <= sp_val <= lgsp): continue # Skip if outside user range
+
+                        # Create Feature and Parse All Fields
+                        feature = QgsFeature(layer.fields())
+                        valid_feature = True
+                        geom = None
+                        
+                        # Add source filename to track where the data came from
+                        if FN_FILENAME in layer.fields().names():
+                            feature[FN_FILENAME] = base_filename
+
+                        for field_name, col_range in self.config['FieldColumns'].items():
+                             if len(line) >= col_range[1]:
+                                 raw_value = line[col_range[0]:col_range[1]].strip()
+                                 field_type = self.config['FieldTypes'].get(field_name)
+                                 if field_type:
+                                     converted_value = self._convert_value(raw_value, field_type)
+                                     if converted_value is not None:
+                                         try:
+                                            feature[field_name] = converted_value
+                                            # Capture Easting/Northing for geometry
+                                            if field_name == FN_EASTING: east_val = converted_value
+                                            elif field_name == FN_NORTHING: north_val = converted_value
+                                         except (TypeError, KeyError): # Handle case where field doesn't exist on layer (shouldn't happen with validation) or conversion failed badly
+                                             QgsMessageLog.logMessage(f"Error setting attribute '{field_name}' on line {line_num} of {os.path.basename(file_path)}", "MapCatalog Import", Qgis.Warning)
+                                             valid_feature = False; break
+                                     else:
+                                         # Conversion failed, potentially skip or log?
+                                         # feature[field_name] = None # Set as NULL if conversion fails? Or skip feature?
+                                         if field_name in self._required_field_names: # Fail if required field is invalid
+                                             valid_feature = False; break
+                                         else: feature[field_name] = None # Set optional field to NULL
+                             else: # Line too short for this field
+                                 if field_name in self._required_field_names: # Fail if required field is missing
+                                     valid_feature = False; break
+                                 else: feature[field_name] = None # Set optional field to NULL
+
+                        # Set Geometry if coordinates were valid
+                        if valid_feature and 'east_val' in locals() and 'north_val' in locals():
+                             try:
+                                 point = QgsPointXY(float(east_val), float(north_val))
+                                 geom = QgsGeometry.fromPointXY(point)
+                                 feature.setGeometry(geom)
+                             except (ValueError, TypeError):
+                                 QgsMessageLog.logMessage(f"Invalid coordinates on line {line_num}: E={east_val}, N={north_val}", "MapCatalog Import", Qgis.Warning)
+                                 valid_feature = False # Skip feature with invalid geometry
+
+                        # Add feature to list if valid
+                        if valid_feature:
+                            features_to_add.append(feature)
+
+                    except (ValueError, IndexError) as parse_err:
+                        QgsMessageLog.logMessage(f"Skipping line {line_num} in '{os.path.basename(file_path)}' due to parsing error: {parse_err}", "MapCatalog Import", Qgis.Warning)
+                        features_to_add.append(feature)
+                
+                # Process in batches to optimize memory usage and performance with 1M+ rows
+                if len(features_to_add) >= 10000:  # Process in batches of 10,000 features
+                    success = self._add_features_batch(layer, features_to_add, file_path)
+                    if not success:
+                        return False
+                    features_to_add = []  # Clear the batch after successful addition
+
+            # Add any remaining features after processing the file
+            if features_to_add:  # Only if features parsed
+                success = self._add_features_batch(layer, features_to_add, file_path)
+                if not success:
+                    return False
+                
+            total_features = getattr(self, '_total_processed_features', 0)
+            QgsMessageLog.logMessage(f"Successfully imported a total of {total_features} features from '{os.path.basename(file_path)}' to layer '{layer.name()}'.", "MapCatalog Import", Qgis.Info)
+
+            progress_dialog.setValue(base_progress_value) # Mark file as done
+            return True
+
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Critical error processing file '{file_path}': {e}\n{traceback.format_exc()}", "MapCatalog Import", Qgis.Critical)
+            if layer.isEditing(): layer.rollBack()
+            return False
+
+
+    def _add_features_batch(self, layer, features_batch, file_path):
+        """Adds a batch of features to the layer with optimized transaction handling.
+        Returns True on success, False on failure.
+        """
+        if not features_batch:
+            return True  # Nothing to add
+            
+        # Track total processed features for reporting
+        if not hasattr(self, '_total_processed_features'):
+            self._total_processed_features = 0
+        
+        batch_size = len(features_batch)
+        base_filename = os.path.basename(file_path)
+        
+        # Use provider for faster direct access
+        pr = layer.dataProvider()
+        
+        # Start editing with a transaction
+        layer.startEditing()
+        
+        try:
+            # Add features in a single operation
+            success = pr.addFeatures(features_batch)
+            
+            if success:
+                # Commit the changes
+                if layer.commitChanges():
+                    # Update total count on success
+                    self._total_processed_features += batch_size
+                    QgsMessageLog.logMessage(
+                        f"Added batch of {batch_size} features from '{base_filename}'", 
+                        "MapCatalog Import", 
+                        Qgis.Info
+                    )
+                    return True
+                else:
+                    # Handle commit failure
+                    error_msg = f"Commit failed for batch of {batch_size} features from {base_filename}: {layer.commitErrors()}"
+                    QgsMessageLog.logMessage(error_msg, "MapCatalog Import", Qgis.Critical)
+                    layer.rollBack()
+                    return False
+            else:
+                # Handle addFeatures failure
+                QgsMessageLog.logMessage(
+                    f"addFeatures failed for batch of {batch_size} features from {base_filename}", 
+                    "MapCatalog Import", 
+                    Qgis.Critical
+                )
+                layer.rollBack()
+                return False
+                
+        except Exception as e:
+            # Handle any exceptions
+            QgsMessageLog.logMessage(
+                f"Exception processing batch from {base_filename}: {str(e)}", 
+                "MapCatalog Import", 
+                Qgis.Critical
+            )
+            if layer.isEditing():
+                layer.rollBack()
+            return False
+    
+    def _convert_value(self, value_str, field_type):
+        """Converts string value based on field type from config."""
+        if not value_str: # Handle empty strings -> NULL
+            return None
+        try:
+            if field_type == 'Int':
+                return int(value_str)
+            elif field_type == 'Float':
+                # Handle potential thousands separators or other locale issues if necessary
+                return float(value_str)
+            elif field_type == 'Str':
+                return value_str # Already a string, just return
+            elif field_type == 'hhmmss':
+                # Expects HHMMSS format e.g., 143055
+                if len(value_str) == 6:
+                     # Return as string for simplicity, or convert to QTime/datetime if needed
+                     # return f"{value_str[0:2]}:{value_str[2:4]}:{value_str[4:6]}"
+                     return value_str # Store as string in DB
+                else: return None # Invalid format
+            elif field_type == 'hhmmss.ssssss':
+                 # Expects HHMMSS.ffffff format e.g., 143055.123456 (Microseconds are often chars 75-80 + 81-87)
+                 # For simplicity store as string, QGIS might not have native microsecond time type
+                 # Could also store seconds since midnight as float if needed for calculations
+                 return value_str
+            else:
+                 # Unknown type, return as string? Or None?
+                 QgsMessageLog.logMessage(f"Unknown field type '{field_type}' encountered during conversion.", "MapCatalog Convert", Qgis.Warning)
+                 return value_str # Default to string
+        except (ValueError, TypeError):
+            # QgsMessageLog.logMessage(f"Conversion error for value '{value_str}' to type '{field_type}'", "MapCatalog Convert", Qgis.Warning)
+            return None # Return NULL on conversion error
+
+
+    def _create_gpkg_layer(self, gpkg_path, layer_name, crs):
+        """Creates a new GeoPackage layer with schema based on config."""
+        if not self.config: return None
+
+        fields = QgsFields()
+        # Map config type strings to QVariant types AND Type Names
+        qgis_type_map = {
+            # ConfigType: (QVariant.Type, TypeNameString)
+            'Int': (QVariant.Int, 'Integer'),
+            'Float': (QVariant.Double, 'Real'), # Use Double for QVariant, Real for TypeName
+            'Str': (QVariant.String, 'String'),
+            'hhmmss': (QVariant.String, 'String'), # Store times as string
+            'hhmmss.ssssss': (QVariant.String, 'String') # Store times as string
+            # Add mappings for other types if needed (e.g., Date, DateTime)
+        }
+
+        type_section = 'FieldTypes'
+        if type_section not in self.config:
+             QgsMessageLog.logMessage(f"Cannot create layer: Section [{type_section}] missing in configuration.", "MapCatalog CreateLayer", Qgis.Critical)
+             return None
+
+        for field_name, field_type_str in self.config[type_section].items():
+            qgis_type, type_name = qgis_type_map.get(field_type_str, (QVariant.String, 'String')) # Default to String
+
+            # Use the non-deprecated approach with field setters
+            field = QgsField()
+            field.setName(field_name)
+            field.setType(qgis_type)
+            field.setTypeName(type_name)
+            fields.append(field)
+            
+        # Always add the FileName field regardless of whether it's in the config
+        # This ensures all new layers can track source files
+        if FN_FILENAME not in [f.name() for f in fields]:
+            field = QgsField()
+            field.setName(FN_FILENAME)
+            field.setType(QVariant.String)
+            field.setTypeName('String')
+            field.setLength(255)  # Allow for long paths
+            fields.append(field)
+
+        # Check if fields were created
+        if not fields.count():
+             QgsMessageLog.logMessage("Cannot create layer: No fields defined in configuration.", "MapCatalog CreateLayer", Qgis.Critical)
+             return None
+
+        # --- The rest of the function remains the same ---
+
+        # Use QgsVectorFileWriter to create the layer
+        writer_options = QgsVectorFileWriter.SaveVectorOptions()
+        writer_options.driverName = "GPKG"
+        writer_options.layerName = layer_name
+        # Optional: Set specific creation options if needed
+        # writer_options.datasourceOptions = ["GEOMETRY_NAME=geom"]
+
+        # Ensure directory exists
+        gpkg_dir = os.path.dirname(gpkg_path)
+        if not os.path.exists(gpkg_dir):
+            try: os.makedirs(gpkg_dir)
+            except OSError as e:
+                QgsMessageLog.logMessage(f"Failed to create directory {gpkg_dir}: {e}", "MapCatalog CreateLayer", Qgis.Critical)
+                return None
+
+        # Create a dummy in-memory layer with the CORRECT schema
+        temp_layer = QgsVectorLayer(f"Point?crs={crs.authid()}", "temporary_points", "memory")
+        temp_pr = temp_layer.dataProvider()
+        temp_pr.addAttributes(fields.toList()) # Add fields to the memory layer
+        temp_layer.updateFields()
+
+        # Set performance-optimized options for large datasets (1M+ rows)
+        writer_options.layerOptions = [
+            'SPATIAL_INDEX=YES',       # Create spatial index for faster spatial queries
+            'TRANSACTION_SIZE=65536'   # Use larger transactions for faster bulk inserts
+        ]
+        
+        # In newer QGIS versions, writeAsVectorFormatV3 returns a tuple with more than 2 values
+        # The first value is still the error code
+        result = QgsVectorFileWriter.writeAsVectorFormatV3(
+            temp_layer, # Use the memory layer with the correct schema
+            gpkg_path,
+            QgsProject.instance().transformContext(), # Use project transform context
+            writer_options
+        )
+        err = result[0]  # First element is still the error code
+
+        if err != QgsVectorFileWriter.NoError:
+             # Error message might be in the second position, but let's be safe and just report the error code
+             QgsMessageLog.logMessage(f"Error creating GeoPackage '{gpkg_path}': (Code: {err})", "MapCatalog CreateLayer", Qgis.Critical)
+             # Clean up potentially incomplete file? Risky.
+             # if os.path.exists(gpkg_path):
+             #     try: os.remove(gpkg_path)
+             #     except OSError: pass
+             return None
+
+        # Now load the created layer - schema should be correct now
+        created_layer = QgsVectorLayer(f"{gpkg_path}|layername={layer_name}", layer_name, "ogr")
+        if not created_layer.isValid():
+            QgsMessageLog.logMessage(f"Failed to load newly created layer: {gpkg_path}|layername={layer_name}", "MapCatalog CreateLayer", Qgis.Critical)
+            return None
+
+        # No need to add fields again if writing from a correctly structured memory layer worked
+        
+        # Create attribute indices for key fields (critical for performance with 1M+ rows)
+        QgsMessageLog.logMessage(f"Creating attribute indices for {layer_name}...", "MapCatalog CreateLayer", Qgis.Info)
+        provider = created_layer.dataProvider()
+        
+        # Key fields to index (sequence, line, shotpoint, and filename for faster searches)
+        index_fields = [FN_SEQUENCE, FN_LINENAME, FN_SHOTPOINT, FN_FILENAME]
+        
+        # Create indices for fields that exist in the layer
+        created_indices = []
+        for field_name in index_fields:
+            field_idx = created_layer.fields().indexFromName(field_name)
+            if field_idx >= 0:  # Field exists
+                if provider.createAttributeIndex(field_idx):
+                    created_indices.append(field_name)
+                    QgsMessageLog.logMessage(f"Created index for field '{field_name}'", "MapCatalog CreateLayer", Qgis.Info)
+                else:
+                    QgsMessageLog.logMessage(f"Failed to create index for field '{field_name}'", "MapCatalog CreateLayer", Qgis.Warning)
+        
+        # Add SQLite optimizations - these dramatically improve performance for large datasets
+        try:
+            # This reopens the layer with optimized SQLite parameters
+            layer_uri = f"{gpkg_path}|layername={layer_name}|option:PRAGMA synchronous=NORMAL|option:PRAGMA journal_mode=WAL"
+            created_layer.setDataSource(layer_uri, layer_name, "ogr")
+            QgsMessageLog.logMessage("Applied SQLite performance optimizations", "MapCatalog CreateLayer", Qgis.Info)
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Could not apply SQLite optimizations: {str(e)}", "MapCatalog CreateLayer", Qgis.Warning)
+        
+        QgsMessageLog.logMessage(
+            f"Successfully created layer '{layer_name}' in {gpkg_path} with {len(created_indices)} indices", 
+            "MapCatalog CreateLayer", 
+            Qgis.Info
+        )
+        return created_layer
+
+
+    # --- Core Plugin Logic (Phase 4: Update/Delete) ---
+
+    def on_update_line_clicked(self):
+        """Handles 'Update Line' button click."""
+        if not self.current_layer or not self.listWidget.currentItem() or not self.config:
+            return
+
+        selected_item = self.listWidget.currentItem()
+        item_data_variant = selected_item.data(Qt.UserRole)
+        item_data = item_data_variant.value() if isinstance(item_data_variant, QVariant) else item_data_variant
+
+        if not isinstance(item_data, dict): return
+
+        sequence = item_data.get('sequence')
+        line_name = item_data.get('line_name')
+        if sequence is None or line_name is None: return
+
+        # Get NEW FGSP/LGSP from spin boxes
+        new_fgsp = self.fgspspinBox.value()
+        new_lgsp = self.lgspspinbox.value()
+
+        if new_fgsp > new_lgsp:
+            QMessageBox.warning(self, "Invalid Range", "FGSP cannot be greater than LGSP.")
+            return
+
+        # Validate inputs more strictly
+        if not isinstance(sequence, int) or not isinstance(line_name, int):
+            QMessageBox.warning(self, "Invalid Data", "Sequence and Line Name must be integers.")
+            return
+        
+        if new_fgsp <= 0 or new_lgsp <= 0:
+            QMessageBox.warning(self, "Invalid Range", "FGSP and LGSP must be positive values.")
+            return
+
+        # Count how many points will be affected (outside the new range)
+        outside_range_expr = f" \"{FN_SEQUENCE}\" = {sequence} AND \"{FN_LINENAME}\" = {line_name} " + \
+                            f" AND ( \"{FN_SHOTPOINT}\" < {new_fgsp} OR \"{FN_SHOTPOINT}\" > {new_lgsp} )"
+        
+        # Also count total points to ensure we're not deleting everything
+        total_expr = f" \"{FN_SEQUENCE}\" = {sequence} AND \"{FN_LINENAME}\" = {line_name} "
+        
+        request_outside = QgsFeatureRequest().setFilterExpression(outside_range_expr).setFlags(QgsFeatureRequest.NoGeometry)
+        request_total = QgsFeatureRequest().setFilterExpression(total_expr).setFlags(QgsFeatureRequest.NoGeometry)
+        
+        count_outside = len([f.id() for f in self.current_layer.getFeatures(request_outside)])
+        count_total = len([f.id() for f in self.current_layer.getFeatures(request_total)])
+        count_remaining = count_total - count_outside
+        
+        # Safety check - make sure we're not deleting all points
+        if count_remaining <= 0:
+            QMessageBox.critical(self, "Safety Error", 
+                              f"This operation would delete ALL {count_total} points for Seq={sequence}, Line={line_name}.\n\n" +
+                              f"The range FGSP={new_fgsp} to LGSP={new_lgsp} would leave no points. Operation canceled.")
+            return
+        
+        # Enhanced confirmation with counts
+        reply = QMessageBox.question(self, "Confirm Update",
+                                   f"Update line Seq={sequence}, Line={line_name}?\n\n" +
+                                   f"• Total points: {count_total}\n" +
+                                   f"• Points to delete: {count_outside}\n" +
+                                   f"• Points to keep: {count_remaining}\n\n" +
+                                   f"This will DELETE {count_outside} points outside the new range FGSP={new_fgsp} to LGSP={new_lgsp}.\n" +
+                                   "This action cannot be undone.",
+                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No: return
+
+        # Double-check the filter expression for syntax errors
+        try:
+            expression = QgsExpression(outside_range_expr)
+            if expression.hasParserError():
+                error = expression.parserErrorString()
+                QMessageBox.critical(self, "Expression Error", f"Filter expression has an error: {error}\nOperation canceled.")
+                QgsMessageLog.logMessage(f"Update Line: Filter expression error: {error}", "MapCatalog Modify", Qgis.Critical)
+                return
+        except Exception as e:
+            QMessageBox.critical(self, "Expression Error", f"Filter expression error: {str(e)}\nOperation canceled.")
+            QgsMessageLog.logMessage(f"Update Line: Filter expression exception: {str(e)}", "MapCatalog Modify", Qgis.Critical)
+            return
+
+        # Now it's safe to delete the points
+        self._delete_features_by_filter(self.current_layer, outside_range_expr, "Update Line")
+        self.refresh_line_summary_list() # Refresh list to show changes
+
+
+    def on_delete_line_clicked(self):
+        """Handles 'Delete Line' button click."""
+        if not self.current_layer or not self.listWidget.currentItem() or not self.config:
+            return
+
+        selected_item = self.listWidget.currentItem()
+        item_data_variant = selected_item.data(Qt.UserRole)
+        item_data = item_data_variant.value() if isinstance(item_data_variant, QVariant) else item_data_variant
+
+        if not isinstance(item_data, dict): return
+
+        sequence = item_data.get('sequence')
+        line_name = item_data.get('line_name')
+        if sequence is None or line_name is None: return
+
+        # Confirm action
+        reply = QMessageBox.question(self, "Confirm Delete",
+                                     f"Delete ALL points for line Seq={sequence}, Line={line_name}?\n"
+                                     "This action cannot be undone.",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No: return
+
+        # Construct filter expression for points to DELETE
+        filter_expr = f" \"{FN_SEQUENCE}\" = {sequence} AND \"{FN_LINENAME}\" = {line_name} "
+
+        self._delete_features_by_filter(self.current_layer, filter_expr, "Delete Line")
+        self.refresh_line_summary_list() # Refresh list to show changes
+
+
+    def _delete_features_by_filter(self, layer, filter_expression, operation_name="Operation"):
+        """Deletes features matching the filter expression in the layer."""
+        # Check if layer is valid and has the right capabilities
+        if not layer.isValid():
+            error_msg = f"{operation_name}: Layer is not valid"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+            QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+            return False
+            
+        # Check if the layer is editable
+        caps = layer.dataProvider().capabilities()
+        if not (caps & QgsVectorDataProvider.DeleteFeatures):
+            # Try to find a workaround - check if we can use the layer's editing interface instead
+            reply = QMessageBox.question(
+                self, 
+                "Layer Restriction", 
+                f"The layer does not support direct feature deletion.\n\n" +
+                f"This may be due to permissions or layer settings.\n\n" +
+                f"Would you like to try using QGIS editing mode to delete features? " +
+                f"This may work even if the data provider doesn't support deletion.",
+                QMessageBox.Yes | QMessageBox.No, 
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.No:
+                error_msg = f"{operation_name}: Layer does not support feature deletion"
+                QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+                QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+                return False
+                
+            # If user said Yes, we'll continue and try the editing interface approach
+            QgsMessageLog.logMessage(
+                f"{operation_name}: Layer doesn't support deletion via provider, trying editing interface", 
+                "MapCatalog Modify", 
+                Qgis.Info
+            )
+            
+        # Check for read-only status
+        if layer.readOnly():
+            error_msg = f"{operation_name}: Layer is read-only"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+            QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+            return False
+            
+        # Validate the expression first
+        expr = QgsExpression(filter_expression)
+        if expr.hasParserError():
+            error_msg = f"{operation_name}: Invalid filter expression: {expr.parserErrorString()}"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+            QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+            return False
+        
+        # Create a feature request with the expression
+        request = QgsFeatureRequest().setFilterExpression(filter_expression).setFlags(QgsFeatureRequest.NoGeometry)
+
+        # Find features to delete - using layer.getFeatures() instead of provider
+        features_to_delete = []
+        for f in layer.getFeatures(request):
+            features_to_delete.append(f.id())
+
+        # Check if we found any features
+        if not features_to_delete:
+            QgsMessageLog.logMessage(f"{operation_name}: No features found matching filter '{filter_expression}'.", "MapCatalog Modify", Qgis.Info)
+            QMessageBox.information(self, operation_name, "No matching points found to delete.")
+            return False
+
+        QgsMessageLog.logMessage(f"{operation_name}: Attempting to delete {len(features_to_delete)} features matching '{filter_expression}'...", "MapCatalog Modify", Qgis.Info)
+
+        # Get the QGIS project
+        project = QgsProject.instance()
+        
+        # Check if the layer is part of the project
+        if not project.mapLayer(layer.id()):
+            QgsMessageLog.logMessage(f"{operation_name}: Layer is not in the current project. Attempting to add it.", "MapCatalog Modify", Qgis.Info)
+            # Try to add the layer to the project if it's not already there
+            success = project.addMapLayer(layer)
+            if not success:
+                error_msg = f"{operation_name}: Could not add layer to project for editing"
+                QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+                QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+                return False
+        
+        # Skip the provider capability check - just force editing mode
+        QgsMessageLog.logMessage(f"{operation_name}: Using QGIS editing session to delete features.", "MapCatalog Modify", Qgis.Info)
+        
+        # Check if the layer source path exists and is writable
+        source_path = layer.source().split('|')[0]  # Get the file path without any additional connection params
+        source_permissions = "Unknown"
+        try:
+            if os.path.exists(source_path):
+                source_permissions = "Writable" if os.access(source_path, os.W_OK) else "Read-only"
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error checking source permissions: {str(e)}", "MapCatalog Modify", Qgis.Warning)
+
+        # Make sure we have a clean edit buffer
+        if layer.isEditable():
+            layer.rollBack()
+
+        # Try to start a new edit session
+        edit_result = layer.startEditing()
+        if not edit_result:
+            # More detailed diagnostics
+            error_details = [
+                f"Layer name: {layer.name()}",
+                f"Layer source: {layer.source()}",
+                f"Source file permissions: {source_permissions}",
+                f"Layer validity: {'Valid' if layer.isValid() else 'Invalid'}",
+                f"Layer is read-only: {'Yes' if layer.readOnly() else 'No'}",
+                f"Edit capabilities: {str(layer.dataProvider().capabilities())}"
+            ]
+            
+            error_msg = f"{operation_name}: Could not start editing session\n\nDiagnostic info:\n" + "\n".join(error_details)
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+            
+            # Provide guidance
+            guidance = [
+                "Possible solutions:",
+                "1. Check if the file has write permissions",
+                "2. Close any other applications that might be using this GeoPackage",
+                "3. Try restarting QGIS",
+                "4. Make a copy of the layer with 'Export > Save Features As...' and work on the copy",
+                "\nWould you like to try making a backup copy of this layer and modifying that instead?"
+            ]
+            
+            reply = QMessageBox.question(
+                self, 
+                "Editing Restricted", 
+                error_msg + "\n\n" + "\n".join(guidance),
+                QMessageBox.Yes | QMessageBox.No, 
+                QMessageBox.Yes
+            )
+            
+            if reply == QMessageBox.Yes:
+                # TODO: Implement layer copy functionality here in a future update
+                QMessageBox.information(self, "Future Enhancement", "This feature will be implemented in a future update. For now, please use QGIS 'Export > Save Features As...' functionality to make a copy of the layer.")
+            
+            return False
+        
+        # Delete features directly through the layer
+        success = True
+        try:
+            # Use a selection-based approach first (more reliable in QGIS)
+            layer.selectByIds(features_to_delete)
+            if layer.selectedFeatureCount() > 0:
+                if not layer.deleteSelectedFeatures():
+                    success = False
+                    QgsMessageLog.logMessage(f"{operation_name}: Failed to delete selected features", "MapCatalog Modify", Qgis.Warning)
+            else:
+                # Fallback to deleting one by one
+                for fid in features_to_delete:
+                    if not layer.deleteFeature(fid):
+                        success = False
+                        QgsMessageLog.logMessage(f"{operation_name}: Failed to delete feature ID {fid}", "MapCatalog Modify", Qgis.Warning)
+        except Exception as e:
+            success = False
+            QgsMessageLog.logMessage(f"{operation_name}: Exception during deletion: {str(e)}", "MapCatalog Modify", Qgis.Critical)
+        
+        # Commit or rollback based on success
+        if success:
+            if layer.commitChanges():
+                QgsMessageLog.logMessage(f"{operation_name}: Successfully deleted {len(features_to_delete)} features.", "MapCatalog Modify", Qgis.Info)
+                QMessageBox.information(self, operation_name, f"Successfully deleted {len(features_to_delete)} points.")
+                return True
+            else:
+                error_msg = f"{operation_name} commit failed: {layer.commitErrors()}"
+                QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+                # Try to rollback if commit failed
+                layer.rollBack()
+                QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+                return False
+        else:
+            error_msg = f"{operation_name}: deleteFeatures failed."
+            QgsMessageLog.logMessage(error_msg, "MapCatalog Modify", Qgis.Critical)
+            # Try to rollback
+            layer.rollBack()
+            QMessageBox.critical(self, "Error", f"{operation_name} failed.\n{error_msg}")
+            return False
+
+    # --- Export Functions ---
+    def on_export_xyz_clicked(self):
+        """Handles the Export XYZ button click to export depth data."""
+        if not self.current_layer or not self.current_layer.isValid():
+            QMessageBox.warning(self, "No Layer Selected", "Please select a valid Map Catalog layer first.")
+            return
+            
+        # Check if the layer has the necessary fields
+        required_fields = [FN_EASTING, FN_NORTHING, "WaterDepth", FN_SEQUENCE]
+        missing_fields = [field for field in required_fields if field not in self.current_layer.fields().names()]
+        
+        if missing_fields:
+            QMessageBox.warning(self, "Missing Fields", 
+                               f"The current layer is missing required fields: {', '.join(missing_fields)}\n" +
+                               "XYZ export requires Easting, Northing, and WaterDepth fields.")
+            return
+            
+        # Get sequence range from user
+        first_seq, ok = QInputDialog.getInt(self, "Input", "Enter first sequence:", 1000, 0, 9999)
+        if not ok:
+            return
+            
+        last_seq, ok = QInputDialog.getInt(self, "Input", "Enter last sequence:", first_seq, first_seq, 9999)
+        if not ok:
+            return
+            
+        # Get output file path
+        default_path = os.path.join(self.project.homePath() or os.path.expanduser("~"), 
+                                   f"Petrobras_MMBC2025_Merged_Depth_COS.xyz")
+        output_path, _ = QFileDialog.getSaveFileName(self, "Save XYZ File", default_path, "XYZ Files (*.xyz)")
+        
+        if not output_path:
+            return  # User cancelled
+            
+        # Add .xyz extension if not present
+        if not output_path.lower().endswith('.xyz'):
+            output_path += '.xyz'
+            
+        # Create a progress dialog
+        progress = QProgressDialog("Exporting XYZ data...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setValue(0)
+        progress.show()
+        
+        try:
+            # Setup the filter expression for the sequence range
+            expr = f"\"{FN_SEQUENCE}\" >= {first_seq} AND \"{FN_SEQUENCE}\" <= {last_seq}"
+            request = QgsFeatureRequest().setFilterExpression(expr)
+            
+            # Only request the fields we need (optimization for large datasets)
+            field_indices = [self.current_layer.fields().indexFromName(field) for field in 
+                            [FN_EASTING, FN_NORTHING, "WaterDepth"]]
+            request.setSubsetOfAttributes(field_indices)
+            
+            # Count total features for progress reporting
+            count_request = QgsFeatureRequest(request)
+            total_features = sum(1 for _ in self.current_layer.getFeatures(count_request))
+            
+            if total_features == 0:
+                QMessageBox.warning(self, "No Data", f"No features found for sequence range {first_seq}-{last_seq}.")
+                progress.close()
+                return
+                
+            # Open output file and write header
+            with open(output_path, 'w') as f:
+                f.write("easting, northing, depth\n")
+                
+                # Process features
+                processed = 0
+                for feature in self.current_layer.getFeatures(request):
+                    if progress.wasCanceled():
+                        break
+                        
+                    # Extract values, handling potential NULL values
+                    # QgsFeature uses attribute() method and QVariant NULL checking
+                    easting = feature[FN_EASTING] if feature.attribute(FN_EASTING) is not None else "NaN"
+                    northing = feature[FN_NORTHING] if feature.attribute(FN_NORTHING) is not None else "NaN"
+                    depth = feature["WaterDepth"] if feature.attribute("WaterDepth") is not None else "NaN"
+                    
+                    # Write line to file
+                    f.write(f"{easting}, {northing}, {depth}\n")
+                    
+                    # Update progress
+                    processed += 1
+                    if processed % 1000 == 0 or processed == total_features:
+                        progress.setValue(int(processed / total_features * 100))
+                        QCoreApplication.processEvents()  # Keep UI responsive
+            
+            progress.setValue(100)
+            QMessageBox.information(self, "Export Successful", 
+                                 f"Successfully exported {processed} features to {output_path}")
+            
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error exporting XYZ data: {str(e)}\n{traceback.format_exc()}", 
+                                    "MapCatalog Export", Qgis.Critical)
+            QMessageBox.critical(self, "Export Error", f"An error occurred during export: {str(e)}")
+        finally:
+            progress.close()
+    
+    def on_export_csv_clicked(self):
+        """Handles the Export CSV button click to export the entire layer to CSV."""
+        if not self.current_layer or not self.current_layer.isValid():
+            QMessageBox.warning(self, "No Layer Selected", "Please select a valid Map Catalog layer first.")
+            return
+            
+        # Get output file path
+        layer_name = self.current_layer.name()
+        default_path = os.path.join(self.project.homePath() or os.path.expanduser("~"), f"{layer_name}.csv")
+        output_path, _ = QFileDialog.getSaveFileName(self, "Save CSV File", default_path, "CSV Files (*.csv)")
+        
+        if not output_path:
+            return  # User cancelled
+            
+        # Add .csv extension if not present
+        if not output_path.lower().endswith('.csv'):
+            output_path += '.csv'
+            
+        # Create a progress dialog
+        progress = QProgressDialog("Exporting CSV data...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setValue(0)
+        progress.show()
+        
+        try:
+            # Count total features for progress reporting
+            total_features = self.current_layer.featureCount()
+            
+            if total_features == 0:
+                QMessageBox.warning(self, "No Data", "The selected layer contains no features.")
+                progress.close()
+                return
+                
+            # Get all field names from the layer
+            field_names = self.current_layer.fields().names()
+            
+            # Open output file and write header
+            with open(output_path, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(field_names)  # Write header row
+                
+                # Process features
+                processed = 0
+                for feature in self.current_layer.getFeatures():
+                    if progress.wasCanceled():
+                        break
+                        
+                    # Extract all attribute values - using proper NULL checking
+                    row = [feature[name] if feature.attribute(name) is not None else "" for name in field_names]
+                    writer.writerow(row)
+                    
+                    # Update progress
+                    processed += 1
+                    if processed % 1000 == 0 or processed == total_features:
+                        progress.setValue(int(processed / total_features * 100))
+                        QCoreApplication.processEvents()  # Keep UI responsive
+            
+            progress.setValue(100)
+            QMessageBox.information(self, "Export Successful", 
+                                 f"Successfully exported {processed} features to {output_path}")
+            
+        except Exception as e:
+            QgsMessageLog.logMessage(f"Error exporting CSV data: {str(e)}\n{traceback.format_exc()}", 
+                                    "MapCatalog Export", Qgis.Critical)
+            QMessageBox.critical(self, "Export Error", f"An error occurred during export: {str(e)}")
+        finally:
+            progress.close()
+    
+    # --- Utility and Event Handlers ---
+    def on_open_config_clicked(self):
+        """Opens the config.ini file in the default system editor."""
+        if not os.path.exists(self.config_path):
+            QMessageBox.warning(self, "File Not Found", f"Config file not found:\n{self.config_path}")
+            return
+        try:
+            if sys.platform == 'win32': os.startfile(self.config_path)
+            elif sys.platform == 'darwin': subprocess.call(['open', self.config_path])
+            else: subprocess.call(['xdg-open', self.config_path])
+        except Exception as e:
+            error_msg = f"Could not open config file: {e}"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog", Qgis.Warning)
+            QMessageBox.warning(self, "Error Opening File", error_msg)
+
     def closeEvent(self, event):
+        """Emits signal when the dock widget is closed."""
         self.closingPlugin.emit()
         event.accept()
