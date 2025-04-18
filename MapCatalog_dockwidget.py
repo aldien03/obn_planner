@@ -88,6 +88,9 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
         # Export buttons
         self.xyzpushButton.clicked.connect(self.on_export_xyz_clicked)
         self.csvpushButton.clicked.connect(self.on_export_csv_clicked)
+        
+        # Check overlap button
+        self.checkOverlappushButton.clicked.connect(self.on_check_overlap_clicked)
 
         # Initial UI state
         self._update_selection_dependent_ui(None)
@@ -1616,6 +1619,158 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
             QgsMessageLog.logMessage(error_msg, "MapCatalog", Qgis.Warning)
             QMessageBox.warning(self, "Error Opening File", error_msg)
 
+    def on_check_overlap_clicked(self):
+        """Handles the 'Check Overlap' button click to find duplicated ShotPoints within the same LineName."""
+        if not self.current_layer or not self.current_layer.isValid():
+            QMessageBox.warning(self, "No Layer Selected", "Please select a valid Map Catalog layer first.")
+            return
+        
+        # Create a progress dialog
+        progress = QProgressDialog("Checking for overlapped ShotPoints...", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setValue(0)
+        progress.show()
+        QCoreApplication.processEvents()  # Force UI update
+        
+        try:
+            # Get the field indices for LineName, ShotPoint and Sequence
+            line_name_idx = self.current_layer.fields().indexFromName(FN_LINENAME)
+            shot_point_idx = self.current_layer.fields().indexFromName(FN_SHOTPOINT)
+            sequence_idx = self.current_layer.fields().indexFromName(FN_SEQUENCE)
+            
+            if line_name_idx < 0 or shot_point_idx < 0 or sequence_idx < 0:
+                QMessageBox.warning(self, "Invalid Schema", 
+                               f"Layer must contain {FN_LINENAME}, {FN_SHOTPOINT}, and {FN_SEQUENCE} fields.")
+                progress.close()
+                return
+            
+            # Get total features count for progress reporting
+            total_features = self.current_layer.featureCount()
+            if total_features == 0:
+                QMessageBox.information(self, "No Data", "The selected layer contains no features.")
+                progress.close()
+                return
+            
+            # Using defaultdict to efficiently group ShotPoints by LineName
+            line_shot_points = collections.defaultdict(dict)  # LineName -> {ShotPoint -> {sequence: sequence_value}}
+            overlaps = collections.defaultdict(dict)  # LineName -> {ShotPoint -> set of sequences}
+            
+            # First pass: Count occurrences of each ShotPoint per LineName
+            processed = 0
+            for feature in self.current_layer.getFeatures():
+                if progress.wasCanceled():
+                    break
+                
+                line_name = feature[line_name_idx]
+                shot_point = feature[shot_point_idx]
+                sequence = feature[sequence_idx]
+                
+                # Skip features with null values
+                if line_name is None or shot_point is None or sequence is None:
+                    continue
+                
+                # If this ShotPoint already exists for this LineName
+                if shot_point in line_shot_points[line_name]:
+                    # Initialize overlap tracking for this shot point if needed
+                    if shot_point not in overlaps[line_name]:
+                        # Add the existing sequence and the current one to the set
+                        overlaps[line_name][shot_point] = {line_shot_points[line_name][shot_point], sequence}
+                    else:
+                        # Add this sequence to the existing set
+                        overlaps[line_name][shot_point].add(sequence)
+                
+                # Track this ShotPoint's sequence for this LineName
+                line_shot_points[line_name][shot_point] = sequence
+                
+                # Update progress periodically
+                processed += 1
+                if processed % 10000 == 0 or processed == total_features:
+                    progress.setValue(int(processed / total_features * 50))  # First half of progress
+                    QCoreApplication.processEvents()  # Keep UI responsive
+            
+            # Convert overlaps to ranges with sequence information
+            overlap_details = {}
+            processed = 0
+            total_lines = len(overlaps)
+            
+            # Skip range conversion if no overlaps or user canceled
+            if total_lines > 0 and not progress.wasCanceled():
+                # Second pass: Convert individual ShotPoints to ranges
+                for line_name, shot_point_dict in overlaps.items():
+                    # Get the sorted list of shot points
+                    shot_points = sorted(shot_point_dict.keys())
+                    
+                    # Group shot points into ranges
+                    ranges = []
+                    if shot_points:  # Make sure there are shot points
+                        range_start = shot_points[0]
+                        range_end = shot_points[0]
+                        
+                        for i in range(1, len(shot_points)):
+                            if shot_points[i] == range_end + 1:  # Sequential
+                                range_end = shot_points[i]
+                            else:  # Gap in sequence
+                                if range_start == range_end:  # Single point
+                                    ranges.append(f"{range_start}")
+                                else:  # Range
+                                    ranges.append(f"{range_start}-{range_end}")
+                                range_start = shot_points[i]
+                                range_end = shot_points[i]
+                        
+                        # Add the last range
+                        if range_start == range_end:
+                            ranges.append(f"{range_start}")
+                        else:
+                            ranges.append(f"{range_start}-{range_end}")
+                    
+                    # Add to final results with sequence information
+                    overlap_details[line_name] = {
+                        'ranges': ranges,
+                        'shot_point_sequences': {sp: sorted(list(seqs)) for sp, seqs in shot_point_dict.items()}
+                    }
+                    
+                    # Update progress for second half
+                    processed += 1
+                    progress.setValue(50 + int(processed / total_lines * 50))
+                    QCoreApplication.processEvents()
+            
+            progress.setValue(100)
+            
+            # Prepare and show results
+            if not overlaps:
+                QMessageBox.information(self, "No Overlaps Found", 
+                                   "No overlapped ShotPoints found within the same LineName.")
+            else:
+                # Build result text
+                result_text = f"Found overlapped ShotPoints in {len(overlaps)} line(s):\n\n"
+                for line_name, details in overlap_details.items():
+                    result_text += f"Line '{line_name}': {', '.join(details['ranges'])}\n"
+                    
+                    # Add sequence information for each overlapped shot point
+                    result_text += "  Detailed overlaps:\n"
+                    for shot_point, sequences in details['shot_point_sequences'].items():
+                        result_text += f"    ShotPoint {shot_point}: Sequences {', '.join(map(str, sequences))}\n"
+                
+                # Show in a message box with scrollbars if needed
+                msg_box = QMessageBox(self)
+                msg_box.setWindowTitle("Overlapped ShotPoints Found")
+                msg_box.setText("Lines with overlapped ShotPoints:")
+                msg_box.setDetailedText(result_text)
+                msg_box.setIcon(QMessageBox.Warning)
+                msg_box.setStandardButtons(QMessageBox.Ok)
+                msg_box.exec_()
+                
+                # Log to QGIS message log as well
+                QgsMessageLog.logMessage(f"Overlap check found {len(overlaps)} lines with overlaps.\n{result_text}", 
+                                       "MapCatalog", Qgis.Warning)
+        
+        except Exception as e:
+            error_msg = f"Error checking for overlaps: {str(e)}\n{traceback.format_exc()}"
+            QgsMessageLog.logMessage(error_msg, "MapCatalog", Qgis.Critical)
+            QMessageBox.critical(self, "Error", f"An error occurred while checking for overlaps: {str(e)}")
+        finally:
+            progress.close()
+    
     def closeEvent(self, event):
         """Emits signal when the dock widget is closed."""
         self.closingPlugin.emit()
