@@ -85,9 +85,9 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
         self.UpdateLinePushButton.clicked.connect(self.on_update_line_clicked)
         self.DeleteLinepushButton.clicked.connect(self.on_delete_line_clicked)
         
-        # Export buttons
-        self.xyzpushButton.clicked.connect(self.on_export_xyz_clicked)
-        self.csvpushButton.clicked.connect(self.on_export_csv_clicked)
+        # # Export buttons
+        # self.xyzpushButton.clicked.connect(self.on_export_xyz_clicked)
+        # self.csvpushButton.clicked.connect(self.on_export_csv_clicked)
         
         # Check overlap button
         self.checkOverlappushButton.clicked.connect(self.on_check_overlap_clicked)
@@ -250,10 +250,6 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
         self.listWidget.setEnabled(True)
         self.selectMapCatalogcomboBox.setEnabled(True)
         self.openConfigpushButton.setEnabled(True)
-        # Enable export buttons when any layer is selected
-        # These should always be available when a layer is selected
-        self.xyzpushButton.setEnabled(self.current_layer is not None)
-        self.csvpushButton.setEnabled(self.current_layer is not None)
 
 
     # --- Layer Management and UI Population (Phase 2) ---
@@ -343,10 +339,6 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
 
         # Enable import button ONLY if a valid layer is selected (creation handled within import)
         self.ImportLinepushButton.setEnabled(self.config is not None) # Enable if config is loaded, layer check happens in import function
-        
-        # Make sure export buttons are enabled when a layer is selected
-        self.xyzpushButton.setEnabled(self.current_layer is not None)
-        self.csvpushButton.setEnabled(self.current_layer is not None)
         
         self._update_selection_dependent_ui(self.listWidget.currentItem())
 
@@ -1438,172 +1430,8 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
             return False
 
     # --- Export Functions ---
-    def on_export_xyz_clicked(self):
-        """Handles the Export XYZ button click to export depth data."""
-        if not self.current_layer or not self.current_layer.isValid():
-            QMessageBox.warning(self, "No Layer Selected", "Please select a valid Map Catalog layer first.")
-            return
-            
-        # Check if the layer has the necessary fields
-        required_fields = [FN_EASTING, FN_NORTHING, "WaterDepth", FN_SEQUENCE]
-        missing_fields = [field for field in required_fields if field not in self.current_layer.fields().names()]
-        
-        if missing_fields:
-            QMessageBox.warning(self, "Missing Fields", 
-                               f"The current layer is missing required fields: {', '.join(missing_fields)}\n" +
-                               "XYZ export requires Easting, Northing, and WaterDepth fields.")
-            return
-            
-        # Get sequence range from user
-        first_seq, ok = QInputDialog.getInt(self, "Input", "Enter first sequence:", 1000, 0, 9999)
-        if not ok:
-            return
-            
-        last_seq, ok = QInputDialog.getInt(self, "Input", "Enter last sequence:", first_seq, first_seq, 9999)
-        if not ok:
-            return
-            
-        # Get output file path
-        default_path = os.path.join(self.project.homePath() or os.path.expanduser("~"), 
-                                   f"Petrobras_MMBC2025_Merged_Depth_COS.xyz")
-        output_path, _ = QFileDialog.getSaveFileName(self, "Save XYZ File", default_path, "XYZ Files (*.xyz)")
-        
-        if not output_path:
-            return  # User cancelled
-            
-        # Add .xyz extension if not present
-        if not output_path.lower().endswith('.xyz'):
-            output_path += '.xyz'
-            
-        # Create a progress dialog
-        progress = QProgressDialog("Exporting XYZ data...", "Cancel", 0, 100, self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setValue(0)
-        progress.show()
-        
-        try:
-            # Setup the filter expression for the sequence range
-            expr = f"\"{FN_SEQUENCE}\" >= {first_seq} AND \"{FN_SEQUENCE}\" <= {last_seq}"
-            request = QgsFeatureRequest().setFilterExpression(expr)
-            
-            # Only request the fields we need (optimization for large datasets)
-            field_indices = [self.current_layer.fields().indexFromName(field) for field in 
-                            [FN_EASTING, FN_NORTHING, "WaterDepth"]]
-            request.setSubsetOfAttributes(field_indices)
-            
-            # Count total features for progress reporting
-            count_request = QgsFeatureRequest(request)
-            total_features = sum(1 for _ in self.current_layer.getFeatures(count_request))
-            
-            if total_features == 0:
-                QMessageBox.warning(self, "No Data", f"No features found for sequence range {first_seq}-{last_seq}.")
-                progress.close()
-                return
-                
-            # Open output file and write header
-            with open(output_path, 'w') as f:
-                f.write("easting, northing, depth\n")
-                
-                # Process features
-                processed = 0
-                for feature in self.current_layer.getFeatures(request):
-                    if progress.wasCanceled():
-                        break
-                        
-                    # Extract values, handling potential NULL values
-                    # QgsFeature uses attribute() method and QVariant NULL checking
-                    easting = feature[FN_EASTING] if feature.attribute(FN_EASTING) is not None else "NaN"
-                    northing = feature[FN_NORTHING] if feature.attribute(FN_NORTHING) is not None else "NaN"
-                    depth = feature["WaterDepth"] if feature.attribute("WaterDepth") is not None else "NaN"
-                    
-                    # Write line to file
-                    f.write(f"{easting}, {northing}, {depth}\n")
-                    
-                    # Update progress
-                    processed += 1
-                    if processed % 1000 == 0 or processed == total_features:
-                        progress.setValue(int(processed / total_features * 100))
-                        QCoreApplication.processEvents()  # Keep UI responsive
-            
-            progress.setValue(100)
-            QMessageBox.information(self, "Export Successful", 
-                                 f"Successfully exported {processed} features to {output_path}")
-            
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error exporting XYZ data: {str(e)}\n{traceback.format_exc()}", 
-                                    "MapCatalog Export", Qgis.Critical)
-            QMessageBox.critical(self, "Export Error", f"An error occurred during export: {str(e)}")
-        finally:
-            progress.close()
-    
-    def on_export_csv_clicked(self):
-        """Handles the Export CSV button click to export the entire layer to CSV."""
-        if not self.current_layer or not self.current_layer.isValid():
-            QMessageBox.warning(self, "No Layer Selected", "Please select a valid Map Catalog layer first.")
-            return
-            
-        # Get output file path
-        layer_name = self.current_layer.name()
-        default_path = os.path.join(self.project.homePath() or os.path.expanduser("~"), f"{layer_name}.csv")
-        output_path, _ = QFileDialog.getSaveFileName(self, "Save CSV File", default_path, "CSV Files (*.csv)")
-        
-        if not output_path:
-            return  # User cancelled
-            
-        # Add .csv extension if not present
-        if not output_path.lower().endswith('.csv'):
-            output_path += '.csv'
-            
-        # Create a progress dialog
-        progress = QProgressDialog("Exporting CSV data...", "Cancel", 0, 100, self)
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setValue(0)
-        progress.show()
-        
-        try:
-            # Count total features for progress reporting
-            total_features = self.current_layer.featureCount()
-            
-            if total_features == 0:
-                QMessageBox.warning(self, "No Data", "The selected layer contains no features.")
-                progress.close()
-                return
-                
-            # Get all field names from the layer
-            field_names = self.current_layer.fields().names()
-            
-            # Open output file and write header
-            with open(output_path, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(field_names)  # Write header row
-                
-                # Process features
-                processed = 0
-                for feature in self.current_layer.getFeatures():
-                    if progress.wasCanceled():
-                        break
-                        
-                    # Extract all attribute values - using proper NULL checking
-                    row = [feature[name] if feature.attribute(name) is not None else "" for name in field_names]
-                    writer.writerow(row)
-                    
-                    # Update progress
-                    processed += 1
-                    if processed % 1000 == 0 or processed == total_features:
-                        progress.setValue(int(processed / total_features * 100))
-                        QCoreApplication.processEvents()  # Keep UI responsive
-            
-            progress.setValue(100)
-            QMessageBox.information(self, "Export Successful", 
-                                 f"Successfully exported {processed} features to {output_path}")
-            
-        except Exception as e:
-            QgsMessageLog.logMessage(f"Error exporting CSV data: {str(e)}\n{traceback.format_exc()}", 
-                                    "MapCatalog Export", Qgis.Critical)
-            QMessageBox.critical(self, "Export Error", f"An error occurred during export: {str(e)}")
-        finally:
-            progress.close()
-    
+    # Export functionality removed
+
     # --- Utility and Event Handlers ---
     def on_open_config_clicked(self):
         """Opens the config.ini file in the default system editor."""
@@ -1618,9 +1446,10 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
             error_msg = f"Could not open config file: {e}"
             QgsMessageLog.logMessage(error_msg, "MapCatalog", Qgis.Warning)
             QMessageBox.warning(self, "Error Opening File", error_msg)
-
+            
     def on_check_overlap_clicked(self):
-        """Handles the 'Check Overlap' button click to find duplicated ShotPoints within the same LineName."""
+        """Handles the 'Check Overlap' button click to find duplicated ShotPoints within the same LineName.
+        Also offers automatic removal of newer duplicated shotpoints."""
         if not self.current_layer or not self.current_layer.isValid():
             QMessageBox.warning(self, "No Layer Selected", "Please select a valid Map Catalog layer first.")
             return
@@ -1651,12 +1480,18 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
                 progress.close()
                 return
             
+            # Structure to store all features by LineName, ShotPoint, and Sequence
+            # This will let us efficiently look up features for deletion later
+            feature_lookup = collections.defaultdict(lambda: collections.defaultdict(dict))  # LineName -> {ShotPoint -> {Sequence -> feature_id}}
+            
             # Using defaultdict to efficiently group ShotPoints by LineName
-            line_shot_points = collections.defaultdict(dict)  # LineName -> {ShotPoint -> {sequence: sequence_value}}
+            line_shot_points = collections.defaultdict(dict)  # LineName -> {ShotPoint -> set of sequences}
             overlaps = collections.defaultdict(dict)  # LineName -> {ShotPoint -> set of sequences}
             
-            # First pass: Count occurrences of each ShotPoint per LineName
+            # First pass: Find overlaps and store feature IDs
             processed = 0
+            progress.setLabelText("Analyzing data for overlaps...")
+            
             for feature in self.current_layer.getFeatures():
                 if progress.wasCanceled():
                     break
@@ -1669,100 +1504,211 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
                 if line_name is None or shot_point is None or sequence is None:
                     continue
                 
+                # Store the feature ID for potential deletion later
+                feature_lookup[line_name][shot_point][sequence] = feature.id()
+                
                 # If this ShotPoint already exists for this LineName
                 if shot_point in line_shot_points[line_name]:
-                    # Initialize overlap tracking for this shot point if needed
-                    if shot_point not in overlaps[line_name]:
-                        # Add the existing sequence and the current one to the set
-                        overlaps[line_name][shot_point] = {line_shot_points[line_name][shot_point], sequence}
-                    else:
-                        # Add this sequence to the existing set
-                        overlaps[line_name][shot_point].add(sequence)
-                
-                # Track this ShotPoint's sequence for this LineName
-                line_shot_points[line_name][shot_point] = sequence
+                    # Add this sequence to the set of sequences for this shotpoint
+                    line_shot_points[line_name][shot_point].add(sequence)
+                    
+                    # Mark as an overlap
+                    overlaps[line_name][shot_point] = line_shot_points[line_name][shot_point].copy()
+                else:
+                    # Initialize the set of sequences for this shotpoint
+                    line_shot_points[line_name][shot_point] = {sequence}
                 
                 # Update progress periodically
                 processed += 1
                 if processed % 10000 == 0 or processed == total_features:
-                    progress.setValue(int(processed / total_features * 50))  # First half of progress
+                    progress.setValue(int(processed / total_features * 40))  # First 40% of progress
                     QCoreApplication.processEvents()  # Keep UI responsive
             
-            # Convert overlaps to ranges with sequence information
+            # Process overlaps and identify automatic deletion candidates
+            progress.setLabelText("Analyzing overlaps for potential removal...")
+            
+            # Prepare structures for deletion candidates
+            deletion_candidates = collections.defaultdict(lambda: collections.defaultdict(list))  # LineName -> {ShotPoint -> [sequences_to_delete]}
+            deletion_counts = collections.defaultdict(int)  # LineName -> count of points to delete
+            deletion_features = []  # List of feature IDs to delete
+            
+            # Convert overlaps to ranges with sequence information for display
             overlap_details = {}
             processed = 0
             total_lines = len(overlaps)
             
-            # Skip range conversion if no overlaps or user canceled
+            # Skip further processing if no overlaps or user canceled
             if total_lines > 0 and not progress.wasCanceled():
-                # Second pass: Convert individual ShotPoints to ranges
+                # Analyze each line with overlaps
                 for line_name, shot_point_dict in overlaps.items():
-                    # Get the sorted list of shot points
+                    # Get the sorted list of shot points with overlaps
                     shot_points = sorted(shot_point_dict.keys())
                     
-                    # Group shot points into ranges
+                    # Skip if too few points with overlaps
+                    if len(shot_points) < 5:  # Require at least 5 points to consider as a systematic overlap
+                        continue
+                    
+                    # Group shot points into ranges for display
                     ranges = []
+                    continuous_ranges = []  # For checking if we have approximately 10 continuous points
+                    
                     if shot_points:  # Make sure there are shot points
-                        range_start = shot_points[0]
-                        range_end = shot_points[0]
+                        current_range = [shot_points[0]]
                         
                         for i in range(1, len(shot_points)):
-                            if shot_points[i] == range_end + 1:  # Sequential
-                                range_end = shot_points[i]
+                            if shot_points[i] == current_range[-1] + 1:  # Sequential
+                                current_range.append(shot_points[i])
                             else:  # Gap in sequence
-                                if range_start == range_end:  # Single point
-                                    ranges.append(f"{range_start}")
-                                else:  # Range
-                                    ranges.append(f"{range_start}-{range_end}")
-                                range_start = shot_points[i]
-                                range_end = shot_points[i]
+                                # Store the completed range
+                                if len(current_range) > 1:
+                                    continuous_ranges.append(current_range)
+                                    ranges.append(f"{current_range[0]}-{current_range[-1]}")
+                                else:
+                                    ranges.append(f"{current_range[0]}")
+                                
+                                # Start a new range
+                                current_range = [shot_points[i]]
                         
                         # Add the last range
-                        if range_start == range_end:
-                            ranges.append(f"{range_start}")
+                        if len(current_range) > 1:
+                            continuous_ranges.append(current_range)
+                            ranges.append(f"{current_range[0]}-{current_range[-1]}")
                         else:
-                            ranges.append(f"{range_start}-{range_end}")
+                            ranges.append(f"{current_range[0]}")
                     
-                    # Add to final results with sequence information
+                    # Check if we have any ranges close to 10 points (8-12 range)
+                    auto_removal_ranges = [r for r in continuous_ranges if 8 <= len(r) <= 12]
+                    
+                    # Add to final results with sequence information for display
                     overlap_details[line_name] = {
                         'ranges': ranges,
-                        'shot_point_sequences': {sp: sorted(list(seqs)) for sp, seqs in shot_point_dict.items()}
+                        'shot_point_sequences': {sp: sorted(list(shot_point_dict[sp])) for sp in shot_point_dict},
+                        'auto_removal_candidate': len(auto_removal_ranges) > 0
                     }
                     
-                    # Update progress for second half
+                    # For each shotpoint with overlap, determine which sequences to delete (newer ones)
+                    for shot_point, sequences in shot_point_dict.items():
+                        if len(sequences) <= 1:
+                            continue  # No overlap for this point
+                        
+                        # Sort sequences, assuming higher sequence numbers are newer
+                        sorted_sequences = sorted(sequences)
+                        
+                        # Flag the newer sequences for deletion (all except the lowest/oldest)
+                        sequences_to_delete = sorted_sequences[1:]
+                        
+                        # Store sequences to delete for this shot point
+                        deletion_candidates[line_name][shot_point] = sequences_to_delete
+                        deletion_counts[line_name] += len(sequences_to_delete)
+                        
+                        # Look up feature IDs for these sequences
+                        for seq in sequences_to_delete:
+                            feature_id = feature_lookup[line_name][shot_point].get(seq)
+                            if feature_id is not None:
+                                deletion_features.append(feature_id)
+                    
+                    # Update progress
                     processed += 1
-                    progress.setValue(50 + int(processed / total_lines * 50))
+                    progress.setValue(40 + int(processed / total_lines * 30))  # Next 30% of progress
                     QCoreApplication.processEvents()
             
-            progress.setValue(100)
+            # Update progress
+            progress.setValue(80)
+            progress.setLabelText("Finalizing results...")
+            QCoreApplication.processEvents()
             
             # Prepare and show results
             if not overlaps:
                 QMessageBox.information(self, "No Overlaps Found", 
                                    "No overlapped ShotPoints found within the same LineName.")
             else:
-                # Build result text
+                # Build result text with deletion information
                 result_text = f"Found overlapped ShotPoints in {len(overlaps)} line(s):\n\n"
+                auto_removal_candidates = []
+                
                 for line_name, details in overlap_details.items():
                     result_text += f"Line '{line_name}': {', '.join(details['ranges'])}\n"
+                    
+                    # Add count of points that would be deleted for this line
+                    if deletion_counts[line_name] > 0:
+                        result_text += f"  Points to delete: {deletion_counts[line_name]}\n"
+                    
+                    # Flag lines that are candidates for automatic removal (near 10 points)
+                    if details.get('auto_removal_candidate', False):
+                        result_text += f"  *** CANDIDATE FOR AUTOMATIC REMOVAL ***\n"
+                        auto_removal_candidates.append(line_name)
                     
                     # Add sequence information for each overlapped shot point
                     result_text += "  Detailed overlaps:\n"
                     for shot_point, sequences in details['shot_point_sequences'].items():
-                        result_text += f"    ShotPoint {shot_point}: Sequences {', '.join(map(str, sequences))}\n"
+                        seq_str = ', '.join(map(str, sequences))
+                        
+                        # Mark sequences that would be deleted
+                        to_delete = deletion_candidates[line_name].get(shot_point, [])
+                        if to_delete:
+                            delete_str = ', '.join(map(str, to_delete))
+                            result_text += f"    ShotPoint {shot_point}: Sequences {seq_str} (To delete: {delete_str})\n"
+                        else:
+                            result_text += f"    ShotPoint {shot_point}: Sequences {seq_str}\n"
                 
-                # Show in a message box with scrollbars if needed
-                msg_box = QMessageBox(self)
-                msg_box.setWindowTitle("Overlapped ShotPoints Found")
-                msg_box.setText("Lines with overlapped ShotPoints:")
-                msg_box.setDetailedText(result_text)
-                msg_box.setIcon(QMessageBox.Warning)
-                msg_box.setStandardButtons(QMessageBox.Ok)
-                msg_box.exec_()
+                # Summary of points to delete
+                total_to_delete = sum(deletion_counts.values())
+                if total_to_delete > 0:
+                    result_text += f"\nTotal points to delete: {total_to_delete}\n"
+                
+                # For all overlap cases, we'll show a confirmation dialog to delete duplicates
+                # This applies whether it's a systematic overlap or not
+                confirm_dialog = QMessageBox(self)
+                confirm_dialog.setWindowTitle("Overlapped ShotPoints Found - Confirmation Required")
+                
+                # Prepare detailed message with confirmation request
+                message = f"Found {total_to_delete} duplicate shotpoints in {len(overlaps)} line(s).\n\n"
+                
+                # Add info about automatic detection candidates if any
+                if auto_removal_candidates:
+                    candidate_lines = ', '.join(auto_removal_candidates)
+                    message += f"Line(s) {candidate_lines} appear to have systematic overlap \n"
+                    message += f"of approximately 10 points, which suggests newer duplicates.\n\n"
+                
+                message += f"Do you want to delete the {total_to_delete} newer duplicate shotpoints?\n\n"
+                message += f"WARNING: This action cannot be undone!\n\n"
+                message += f"Click 'Delete Duplicates' to remove the points.\n"
+                message += f"Click 'Show Details' to see which points will be deleted.\n"
+                message += f"Click 'Cancel' to keep all points and exit."
+                
+                confirm_dialog.setText(message)
+                confirm_dialog.setDetailedText(result_text)
+                confirm_dialog.setIcon(QMessageBox.Warning)
+                
+                # Create custom buttons with clear labels
+                delete_button = confirm_dialog.addButton("Delete Duplicates", QMessageBox.ActionRole)
+                cancel_button = confirm_dialog.addButton("Cancel", QMessageBox.RejectRole)
+                confirm_dialog.setDefaultButton(cancel_button)  # Make Cancel the default for safety
+                
+                # Execute the dialog and wait for user response
+                confirm_dialog.exec_()
+                
+                # Process the user's choice
+                clicked_button = confirm_dialog.clickedButton()
+                if clicked_button == delete_button:
+                    # User confirmed deletion - now handle the deletion process
+                    QgsMessageLog.logMessage(f"User confirmed deletion of {total_to_delete} duplicate shotpoints.", 
+                                          "MapCatalog", Qgis.Info)
+                    self._handle_overlap_deletion(deletion_features, total_to_delete)
+                else:
+                    # User canceled or closed the dialog
+                    QgsMessageLog.logMessage(f"User canceled deletion of {total_to_delete} duplicate shotpoints.", 
+                                          "MapCatalog", Qgis.Info)
+                
+                # Note: We removed the else clause here since we now show the confirmation
+                # dialog for all overlap cases
                 
                 # Log to QGIS message log as well
                 QgsMessageLog.logMessage(f"Overlap check found {len(overlaps)} lines with overlaps.\n{result_text}", 
                                        "MapCatalog", Qgis.Warning)
+                
+            # Final progress update
+            progress.setValue(100)
         
         except Exception as e:
             error_msg = f"Error checking for overlaps: {str(e)}\n{traceback.format_exc()}"
@@ -1771,6 +1717,81 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
         finally:
             progress.close()
     
+    def _handle_overlap_deletion(self, deletion_features, total_count):
+        """Handles deletion of overlapped shotpoints after user confirmation."""
+        if deletion_features and self.current_layer:
+            # Create a progress dialog for deletion
+            progress = QProgressDialog(f"Deleting {total_count} duplicate shotpoints...", "Cancel", 0, 100, self)
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setValue(0)
+            progress.show()
+            QCoreApplication.processEvents()
+            
+            try:
+                # Start editing if not already in edit mode
+                already_editing = self.current_layer.isEditable()
+                if not already_editing:
+                    edit_success = self.current_layer.startEditing()
+                    if not edit_success:
+                        QMessageBox.critical(self, "Edit Failed", 
+                                         "Could not start editing the layer. Check if the layer is writable.")
+                        progress.close()
+                        return
+                
+                # Delete features in batches to update progress
+                deleted_count = 0
+                batch_size = max(1, len(deletion_features) // 10)  # Divide into roughly 10 batches
+                
+                for i in range(0, len(deletion_features), batch_size):
+                    batch = deletion_features[i:i+batch_size]
+                    
+                    # Delete this batch
+                    delete_success = self.current_layer.deleteFeatures(batch)
+                    if not delete_success:
+                        QMessageBox.warning(self, "Deletion Warning", 
+                                         f"Some features could not be deleted. {deleted_count} of {total_count} deleted so far.")
+                        break
+                    
+                    deleted_count += len(batch)
+                    progress.setValue(int(deleted_count / total_count * 100))
+                    QCoreApplication.processEvents()
+                    
+                    if progress.wasCanceled():
+                        break
+                
+                # Commit changes if we started editing
+                if not already_editing:
+                    if deleted_count > 0:
+                        commit_success = self.current_layer.commitChanges()
+                        if commit_success:
+                            QMessageBox.information(self, "Deletion Complete", 
+                                                f"Successfully deleted {deleted_count} duplicate shotpoints.")
+                            
+                            # Update the UI to reflect changes
+                            self.refresh_line_summary_list()
+                        else:
+                            QMessageBox.critical(self, "Commit Failed", 
+                                             "Failed to commit changes. The layer may be in an inconsistent state.")
+                            # Roll back changes
+                            self.current_layer.rollBack()
+                    else:
+                        # No features deleted, roll back
+                        self.current_layer.rollBack()
+                        QMessageBox.information(self, "No Changes", 
+                                            "No features were deleted. Operation canceled.")
+            
+            except Exception as e:
+                error_msg = f"Error deleting duplicate shotpoints: {str(e)}\n{traceback.format_exc()}"
+                QgsMessageLog.logMessage(error_msg, "MapCatalog", Qgis.Critical)
+                QMessageBox.critical(self, "Error", f"An error occurred during deletion: {str(e)}")
+                
+                # Try to roll back if we're in edit mode and not already editing
+                if not already_editing and self.current_layer and self.current_layer.isEditable():
+                    self.current_layer.rollBack()
+            
+            finally:
+                progress.close()
+                
     def closeEvent(self, event):
         """Emits signal when the dock widget is closed."""
         self.closingPlugin.emit()

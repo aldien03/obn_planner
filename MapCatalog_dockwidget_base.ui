@@ -117,43 +117,9 @@
     <item>
      <widget class="QPushButton" name="checkOverlappushButton">
       <property name="text">
-       <string>Check Overlap</string>
+       <string>Remove Overlap</string>
       </property>
      </widget>
-    </item>
-    <item>
-     <widget class="QLabel" name="label_3">
-      <property name="font">
-       <font>
-        <weight>75</weight>
-        <bold>true</bold>
-       </font>
-      </property>
-      <property name="text">
-       <string>Generate Deliverables:</string>
-      </property>
-      <property name="alignment">
-       <set>Qt::AlignCenter</set>
-      </property>
-     </widget>
-    </item>
-    <item>
-     <layout class="QHBoxLayout" name="horizontalLayout_4">
-      <item>
-       <widget class="QPushButton" name="xyzpushButton">
-        <property name="text">
-         <string>Export XYZ</string>
-        </property>
-       </widget>
-      </item>
-      <item>
-       <widget class="QPushButton" name="csvpushButton">
-        <property name="text">
-         <string>Export CSV</string>
-        </property>
-       </widget>
-      </item>
-     </layout>
     </item>
    </layout>
   </widget>
