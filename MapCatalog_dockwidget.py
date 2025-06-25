@@ -1636,7 +1636,7 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
                     # Flag lines that are candidates for automatic removal (near 10 points)
                     if details.get('auto_removal_candidate', False):
                         result_text += f"  *** CANDIDATE FOR AUTOMATIC REMOVAL ***\n"
-                        auto_removal_candidates.append(line_name)
+                        auto_removal_candidates.append(str(line_name))
                     
                     # Add sequence information for each overlapped shot point
                     result_text += "  Detailed overlaps:\n"
@@ -1666,7 +1666,7 @@ class MapCatalogDockWidget(QtWidgets.QDockWidget, FORM_CLASS):
                 
                 # Add info about automatic detection candidates if any
                 if auto_removal_candidates:
-                    candidate_lines = ', '.join(auto_removal_candidates)
+                    candidate_lines = ', '.join(map(str, auto_removal_candidates))
                     message += f"Line(s) {candidate_lines} appear to have systematic overlap \n"
                     message += f"of approximately 10 points, which suggests newer duplicates.\n\n"
                 
